@@ -240,6 +240,11 @@ def _read_json_file(path: Path) -> Optional[dict[str, Any]]:
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
     atomic_json_write(path, payload, indent=None, separators=(",", ":"))
+    try:
+        from hermes_state import secure_private_file
+        secure_private_file(path)
+    except Exception:
+        pass
 
 
 def _read_pid_record(pid_path: Optional[Path] = None) -> Optional[dict]:

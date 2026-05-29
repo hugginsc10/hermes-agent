@@ -211,7 +211,10 @@ export ANONYMIZED_TELEMETRY=false
 export HOST=${quoted_host}
 export PORT=${quoted_port}
 source ${quoted_venv}/bin/activate
-exec open-webui serve
+redact_open_webui_log_stream() {
+  sed -E 's/(Password:[[:space:]]*).*/\\1[REDACTED]/I'
+}
+open-webui serve 2>&1 | redact_open_webui_log_stream
 EOF
 
   chmod +x "$LAUNCHER_PATH"
@@ -311,8 +314,8 @@ main() {
   hermes gateway restart >/dev/null 2>&1 || true
   sleep 4
   if ! curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null; then
-    log 'Hermes API server did not answer on the first check. Trying to start gateway in the background...'
-    nohup hermes gateway run >/dev/null 2>&1 &
+    log 'Hermes API server did not answer on the first check. Trying a service-aware gateway reload...'
+    /Users/chas-studio/.local/bin/hermes-gateway-safe-reload --force >/dev/null 2>&1 || hermes gateway restart >/dev/null 2>&1 || hermes gateway start >/dev/null 2>&1 || true
     sleep 6
   fi
   curl -fsS "http://${HERMES_API_CONNECT_HOST}:${HERMES_API_PORT}/health" >/dev/null

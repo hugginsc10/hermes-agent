@@ -198,6 +198,12 @@ def setup_logging(
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
+    from hermes_cli.config import is_managed
+    if not is_managed():
+        try:
+            log_dir.chmod(0o700)
+        except OSError:
+            pass
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -296,28 +302,18 @@ def setup_verbose_logging() -> None:
 # ---------------------------------------------------------------------------
 
 class _ManagedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that ensures group-writable perms in managed mode
-    AND survives external rotation.
+    """RotatingFileHandler that applies safe perms and survives rotation.
 
-    Two responsibilities:
+    Standard Hermes logs can contain prompts, tool payloads, and redacted
+    secret-shaped values, so default to owner-only ``0600``. Managed NixOS
+    deployments keep their existing group-sharing behavior via ``0660``.
 
-    1.  In managed mode (NixOS), the stateDir uses setgid (2770) so new files
-        inherit the hermes group. However, both ``_open()`` (initial creation)
-        and ``doRollover()`` create files via ``open()``, which uses the
-        process umask — typically 0022, producing 0644. This subclass applies
-        ``chmod 0660`` after both operations so the gateway and interactive
-        users can share log files.
-
-    2.  ``RotatingFileHandler`` keeps an open file descriptor.  If anything
-        rotates the file *externally* (``logrotate``, manual ``mv``,
-        another process rotating under us, a transient unlink), our fd
-        keeps pointing at the renamed/unlinked inode and every subsequent
-        write goes to ``gateway.log.1`` instead of ``gateway.log`` — silent
-        log loss for the file every operator expects to read.  Before each
-        emit we ``stat`` ``baseFilename`` and compare it against the open
-        stream's inode; on mismatch we reopen.  This is the same pattern
-        as stdlib ``WatchedFileHandler.reopenIfNeeded()``, adapted for
-        rotating handlers.
+    ``RotatingFileHandler`` keeps an open file descriptor. If anything rotates
+    the file *externally* (``logrotate``, manual ``mv``, another process
+    rotating under us, or a transient unlink), our fd keeps pointing at the
+    renamed/unlinked inode and subsequent writes go to the wrong file. Before
+    each emit we compare ``baseFilename`` against the open stream's inode and
+    reopen on mismatch.
     """
 
     def __init__(self, *args, **kwargs):
@@ -330,12 +326,11 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._stat_ino: Optional[int] = None
         self._record_stream_stat()
 
-    def _chmod_if_managed(self):
-        if self._managed:
-            try:
-                os.chmod(self.baseFilename, 0o660)
-            except OSError:
-                pass
+    def _chmod_log_file(self):
+        try:
+            os.chmod(self.baseFilename, 0o660 if self._managed else 0o600)
+        except OSError:
+            pass
 
     def _record_stream_stat(self) -> None:
         """Snapshot dev/ino of ``baseFilename`` so we can detect external rotation."""
@@ -403,12 +398,12 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
 
     def _open(self):
         stream = super()._open()
-        self._chmod_if_managed()
+        self._chmod_log_file()
         return stream
 
     def doRollover(self):
         super().doRollover()
-        self._chmod_if_managed()
+        self._chmod_log_file()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.
         self._record_stream_stat()

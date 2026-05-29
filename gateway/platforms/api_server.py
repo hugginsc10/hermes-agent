@@ -396,6 +396,8 @@ class ResponseStore:
         """Force owner-only permissions on the DB and SQLite sidecars."""
         if not self._db_path:
             return
+        from hermes_state import secure_private_file
+        secure_private_file(Path(self._db_path))
         for candidate in (
             Path(self._db_path),
             Path(f"{self._db_path}-wal"),
