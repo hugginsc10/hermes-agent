@@ -588,3 +588,88 @@ class TestTelegramApprovalCallback:
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
         assert (tmp_path / ".update_response").read_text() == "n"
+
+    @pytest.mark.asyncio
+    async def test_kanban_approval_callback_posts_workspace_action_and_removes_token(self, tmp_path):
+        adapter = _make_adapter()
+        state_path = tmp_path / "workspace-kanban-telegram-approvals.json"
+        state_path.write_text(
+            '{"version":1,"approvals":{"abc123":{"cardId":"card-1","title":"Demo card","createdAt":1,"expiresAt":4102444800000}}}',
+            encoding="utf-8",
+        )
+
+        query = AsyncMock()
+        query.data = "kb:c:abc123"
+        query.message = MagicMock()
+        query.message.chat_id = -1003979473446
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = 111
+        query.from_user.first_name = "Chas"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_ALLOWED_USERS": "111",
+                "SWARM_KANBAN_TELEGRAM_APPROVAL_STATE_PATH": str(state_path),
+            },
+            clear=False,
+        ):
+            with patch.object(
+                adapter,
+                "_post_kanban_operator_action",
+                return_value={"ok": True, "message": "approved"},
+            ) as post_action:
+                await adapter._handle_callback_query(update, context)
+
+        post_action.assert_called_once_with("card-1", "approve_continue", "Chas")
+        query.answer.assert_called_once_with(text="✅ Approved to continue")
+        query.edit_message_text.assert_called_once()
+        assert "abc123" not in state_path.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_kanban_approval_callback_rejects_unauthorized_user(self, tmp_path):
+        adapter = _make_adapter()
+        state_path = tmp_path / "workspace-kanban-telegram-approvals.json"
+        state_path.write_text(
+            '{"version":1,"approvals":{"abc123":{"cardId":"card-1","title":"Demo card","createdAt":1,"expiresAt":4102444800000}}}',
+            encoding="utf-8",
+        )
+
+        query = AsyncMock()
+        query.data = "kb:d:abc123"
+        query.message = MagicMock()
+        query.message.chat_id = -1003979473446
+        query.message.chat.type = "supergroup"
+        query.from_user = MagicMock()
+        query.from_user.id = 222
+        query.from_user.first_name = "Mallory"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_ALLOWED_USERS": "111",
+                "SWARM_KANBAN_TELEGRAM_APPROVAL_STATE_PATH": str(state_path),
+            },
+            clear=False,
+        ):
+            with patch.object(adapter, "_post_kanban_operator_action") as post_action:
+                await adapter._handle_callback_query(update, context)
+
+        post_action.assert_not_called()
+        query.answer.assert_called_once()
+        assert "not authorized" in query.answer.call_args[1]["text"].lower()
+        query.edit_message_text.assert_not_called()
+        assert "abc123" in state_path.read_text(encoding="utf-8")

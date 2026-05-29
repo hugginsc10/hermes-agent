@@ -559,6 +559,167 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
         return "*" in allowed_ids or normalized_user_id in allowed_ids
 
+    @staticmethod
+    def _kanban_approval_state_path() -> _Path:
+        configured = os.getenv("SWARM_KANBAN_TELEGRAM_APPROVAL_STATE_PATH", "").strip()
+        if configured:
+            return _Path(configured)
+        hermes_home = os.getenv("HERMES_HOME", "").strip() or os.path.expanduser("~/.hermes")
+        return _Path(hermes_home) / "workspace-kanban-telegram-approvals.json"
+
+    def _read_kanban_approval_record(self, token: str) -> Optional[Dict[str, Any]]:
+        path = self._kanban_approval_state_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.warning("[Telegram] Failed to read Kanban approval callback state", exc_info=True)
+            return None
+        approvals = data.get("approvals") if isinstance(data, dict) else None
+        if not isinstance(approvals, dict):
+            return None
+        record = approvals.get(token)
+        if not isinstance(record, dict):
+            return None
+        expires_at = record.get("expiresAt")
+        if isinstance(expires_at, (int, float)) and expires_at < datetime.now(timezone.utc).timestamp() * 1000:
+            self._remove_kanban_approval_record(token)
+            return None
+        card_id = record.get("cardId")
+        if not isinstance(card_id, str) or not card_id.strip():
+            return None
+        return record
+
+    def _remove_kanban_approval_record(self, token: str) -> None:
+        path = self._kanban_approval_state_path()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            approvals = data.get("approvals") if isinstance(data, dict) else None
+            if not isinstance(approvals, dict) or token not in approvals:
+                return
+            del approvals[token]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_suffix(path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            atomic_replace(tmp_path, path)
+        except FileNotFoundError:
+            return
+        except Exception:
+            logger.warning("[Telegram] Failed to remove Kanban approval callback token", exc_info=True)
+
+    @staticmethod
+    def _workspace_api_base_url() -> str:
+        return (
+            os.getenv("HERMES_WORKSPACE_URL", "").strip()
+            or os.getenv("HERMES_WORKSPACE_LOCAL_URL", "").strip()
+            or "http://127.0.0.1:3000"
+        ).rstrip("/")
+
+    def _post_kanban_operator_action(
+        self,
+        card_id: str,
+        action: str,
+        user_display: str,
+    ) -> Dict[str, Any]:
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        url = f"{self._workspace_api_base_url()}/api/swarm-kanban/{urllib.parse.quote(card_id, safe='')}"
+        body = json.dumps({
+            "action": action,
+            "author": f"telegram:{user_display}",
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8")
+            try:
+                parsed_error = json.loads(raw)
+                message = parsed_error.get("error") or parsed_error.get("message") or raw
+            except Exception:
+                message = raw or str(error)
+            raise RuntimeError(str(message)) from error
+
+        parsed = json.loads(raw) if raw.strip() else {}
+        if not isinstance(parsed, dict) or not parsed.get("ok"):
+            message = parsed.get("error") if isinstance(parsed, dict) else None
+            raise RuntimeError(str(message or "Workspace rejected the Kanban approval action"))
+        return parsed
+
+    async def _handle_kanban_approval_callback(
+        self,
+        query: Any,
+        data: str,
+        *,
+        query_chat_id: Any = None,
+        query_chat_type: Any = None,
+        query_thread_id: Any = None,
+        query_user_name: Optional[str] = None,
+    ) -> None:
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"c", "d"}:
+            await query.answer(text="Invalid Kanban approval data.", show_alert=True)
+            return
+
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to resolve Kanban blockers.", show_alert=True)
+            return
+
+        choice = parts[1]
+        token = parts[2]
+        record = self._read_kanban_approval_record(token)
+        if not record:
+            await query.answer(text="This Kanban approval is expired or already resolved.", show_alert=True)
+            return
+
+        action = "approve_continue" if choice == "c" else "approve_complete"
+        label = "✅ Approved to continue" if choice == "c" else "✅ Marked done"
+        user_display = getattr(query.from_user, "first_name", "User") or "User"
+        card_id = str(record["cardId"])
+        title = str(record.get("title") or card_id)
+
+        try:
+            result = await asyncio.to_thread(
+                self._post_kanban_operator_action,
+                card_id,
+                action,
+                user_display,
+            )
+        except Exception as exc:
+            logger.warning("[Telegram] Kanban approval callback failed", exc_info=True)
+            await query.answer(text=f"Kanban action failed: {exc}", show_alert=True)
+            return
+
+        self._remove_kanban_approval_record(token)
+        await query.answer(text=label)
+        message = result.get("message") if isinstance(result, dict) else None
+        try:
+            await query.edit_message_text(
+                text=self.format_message(
+                    f"{label} by {user_display}\n\n{title}\n{message or 'Workspace action completed.'}"
+                ),
+                parse_mode=ParseMode.MARKDOWN_V2 if ParseMode else None,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
@@ -3294,6 +3455,18 @@ class TelegramAdapter(BasePlatformAdapter):
                         await self._send_message_with_thread_fallback(**send_kwargs)
                 except Exception as exc:
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
+            return
+
+        # --- Kanban approval callbacks (kb:c|d:token) ---
+        if data.startswith("kb:"):
+            await self._handle_kanban_approval_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
             return
 
         # --- Clarify callbacks (cl:clarify_id:idx | cl:clarify_id:other) ---
