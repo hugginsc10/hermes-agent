@@ -19,6 +19,7 @@ import logging
 import random
 import re
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -80,6 +81,26 @@ _FTS_TRIGGERS = (
     "messages_fts_trigram_delete",
     "messages_fts_trigram_update",
 )
+
+
+def secure_private_file(path: Path) -> None:
+    """Best-effort owner-only permissions for sensitive local state files.
+
+    The session DB, response store, kanban DB, and runtime status files can
+    contain prompts, tool payloads, or credentials.  On POSIX hosts we tighten
+    the parent directory to ``0700`` and the file to ``0600`` after creation.
+    Windows keeps the existing ACL behavior.
+    """
+    if sys.platform.startswith("win"):
+        return
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        if path.exists():
+            path.chmod(0o600)
+    except OSError:
+        logger.debug("Failed to restrict permissions for %s", path, exc_info=True)
 
 
 def _set_last_init_error(msg: Optional[str]) -> None:
@@ -606,6 +627,8 @@ class SessionDB:
     def __init__(self, db_path: Path = None, read_only: bool = False):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        secure_private_file(self.db_path)
 
         self._lock = threading.Lock()
         self._write_count = 0
@@ -651,6 +674,7 @@ class SessionDB:
                 apply_wal_with_fallback(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
+                secure_private_file(self.db_path)
 
             try:
                 _connect_and_init()

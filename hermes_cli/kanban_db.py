@@ -1440,6 +1440,9 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
+    from hermes_state import secure_private_file
+
+    secure_private_file(path)
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
@@ -1461,6 +1464,7 @@ def connect(
                 # falls back to DELETE with one WARNING so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
+
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
                 # FULL (was NORMAL): fsync before each checkpoint to narrow the
                 # crash window that can leave a b-tree page header torn.
@@ -1483,6 +1487,7 @@ def connect(
                     conn.executescript(SCHEMA_SQL)
                     _migrate_add_optional_columns(conn)
                     _INITIALIZED_PATHS.add(resolved)
+                    secure_private_file(path)
         except Exception:
             conn.close()
             raise
