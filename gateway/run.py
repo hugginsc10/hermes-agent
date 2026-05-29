@@ -10905,7 +10905,104 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     _APPROVAL_TIMEOUT_SECONDS = 300  # 5 minutes
 
+    async def _send_central_exec_approval(
+        self,
+        *,
+        origin_source: SessionSource,
+        command: str,
+        session_key: str,
+        description: str,
+    ) -> bool:
+        """Fan out exec approval prompts to the Hermes Approvals Telegram channel."""
+        target = _central_approval_telegram_target()
+        if not target:
+            return False
+        target_info = _parse_telegram_numeric_target(target)
+        if not target_info:
+            logger.warning("Central approval Telegram target must be telegram:<chat_id>[:thread_id]: %s", target)
+            return False
 
+        if (
+            _gateway_platform_value(origin_source.platform) == "telegram"
+            and str(origin_source.chat_id) == target_info["chat_id"]
+            and str(origin_source.thread_id or "") == str(target_info.get("thread_id", ""))
+        ):
+            return False
+
+        adapter = self.adapters.get(Platform.TELEGRAM)
+        send_exec_approval = getattr(adapter, "send_exec_approval", None) if adapter else None
+        if not adapter or getattr(type(adapter), "send_exec_approval", None) is None or not send_exec_approval:
+            logger.warning("Central approval fanout skipped: Telegram adapter unavailable")
+            return False
+
+        metadata: Dict[str, Any] = {}
+        if target_info.get("thread_id"):
+            metadata["thread_id"] = target_info["thread_id"]
+
+        redacted_command = _redact_gateway_user_facing_secrets(command)
+        redacted_description = _redact_gateway_user_facing_secrets(description)
+        result = await send_exec_approval(
+            chat_id=target_info["chat_id"],
+            command=redacted_command,
+            session_key=session_key,
+            description=redacted_description,
+            metadata=metadata or None,
+        )
+        if not getattr(result, "success", False):
+            logger.warning(
+                "Central approval fanout to %s failed: %s",
+                target,
+                getattr(result, "error", "unknown error"),
+            )
+            return False
+        return True
+
+    async def _send_exec_approval_web_push(
+        self,
+        *,
+        command: str,
+        session_key: str,
+        description: str,
+    ) -> bool:
+        """Best-effort PWA push notification for exec approvals."""
+        endpoint = _workspace_web_push_endpoint()
+        if not endpoint:
+            return False
+
+        def _post() -> bool:
+            import urllib.error
+            import urllib.request
+
+            payload = {
+                "action": "approval",
+                "title": "[Hermes Approval] Command approval required",
+                "body": _approval_push_body(command, description, session_key),
+                "url": "/swarm2?approval=exec",
+                "tag": f"gateway-exec-approval:{session_key}",
+                "requireInteraction": True,
+            }
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    return 200 <= int(getattr(response, "status", 200)) < 300
+            except urllib.error.HTTPError as exc:
+                body = ""
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    body = ""
+                logger.warning("Exec approval web push failed: HTTP %s %s", exc.code, body)
+                return False
+            except Exception as exc:
+                logger.warning("Exec approval web push failed: %s", exc)
+                return False
+
+        return await asyncio.to_thread(_post)
 
     # Built-in messaging platforms where the ``/update`` command is allowed.
     # ACP, API server, and webhooks are programmatic interfaces that should
@@ -14174,6 +14271,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+
+                # Fan out every exec approval to the central Hermes Approvals
+                # Telegram channel and Workspace PWA push. These use the same
+                # session_key as the origin prompt, so Telegram channel buttons
+                # unblock the original waiting agent thread.
+                for _approval_coro, _approval_log in (
+                    (
+                        self._send_central_exec_approval(
+                            origin_source=source,
+                            command=cmd,
+                            session_key=_approval_session_key,
+                            description=desc,
+                        ),
+                        "central Telegram approval fanout",
+                    ),
+                    (
+                        self._send_exec_approval_web_push(
+                            command=cmd,
+                            session_key=_approval_session_key,
+                            description=desc,
+                        ),
+                        "approval PWA push fanout",
+                    ),
+                ):
+                    try:
+                        _fanout_fut = safe_schedule_threadsafe(
+                            _approval_coro,
+                            _loop_for_step,
+                            logger=logger,
+                            log_message=f"{_approval_log} scheduling error",
+                        )
+                        if _fanout_fut is not None:
+                            _fanout_fut.result(timeout=10)
+                    except Exception as _fanout_exc:
+                        logger.warning("%s failed: %s", _approval_log, _fanout_exc)
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
