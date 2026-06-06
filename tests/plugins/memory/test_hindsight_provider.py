@@ -323,6 +323,33 @@ class TestConfig:
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
 
+    @pytest.mark.parametrize("mode", ["local_external", "cloud"])
+    def test_get_client_lazy_ensures_hindsight_client_for_external_modes(self, monkeypatch, mode):
+        """External modes should lazy-install the Hindsight client before import."""
+        captured = {}
+        calls = []
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        def fake_ensure(feature, *, prompt=True):
+            calls.append((feature, prompt))
+
+        monkeypatch.setattr("tools.lazy_deps.ensure", fake_ensure)
+        monkeypatch.setitem(sys.modules, "hindsight_client", SimpleNamespace(Hindsight=FakeHindsight))
+
+        p = HindsightMemoryProvider()
+        p._mode = mode
+        p._api_url = "http://127.0.0.1:8888"
+        p._api_key = ""
+        p._timeout = 7
+
+        p._get_client()
+
+        assert calls == [("memory.hindsight", False)]
+        assert captured == {"base_url": "http://127.0.0.1:8888", "timeout": 7.0}
+
 
 class TestPostSetup:
     def test_local_embedded_setup_materializes_profile_env(self, tmp_path, monkeypatch):
