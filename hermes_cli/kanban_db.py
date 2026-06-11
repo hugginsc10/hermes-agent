@@ -3825,6 +3825,102 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return False
 
 
+def _rescue_unpushed_git_work(wp: Path, task_id: str) -> None:
+    """Preserve unpushed git work before a scratch workspace is deleted.
+
+    Scratch workspaces are removed on task completion/GC, but a worker may
+    have committed work it could not push (missing credentials, network
+    failure, crash mid-handoff). Without this rescue the commits are lost
+    with the directory.
+
+    For the workspace dir itself and each immediate child that is a git
+    repo, any branch with commits not reachable from a remote ref is:
+
+    1. pushed to the clone's ``origin`` (for scratch clones this is the
+       local source repo, so the branch lands somewhere durable), or
+    2. on push failure, captured as a ``git bundle`` plus a working-tree
+       patch under ``<kanban_home>/audit/workspace-rescue/``.
+
+    Best-effort by contract — never raises, never blocks cleanup.
+    """
+    try:
+        candidates: list[Path] = []
+        if (wp / ".git").exists():
+            candidates.append(wp)
+        else:
+            try:
+                children = sorted(p for p in wp.iterdir() if p.is_dir())
+            except OSError:
+                children = []
+            candidates.extend(c for c in children if (c / ".git").exists())
+
+        for repo in candidates:
+            def _git(*args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+                return subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    capture_output=True, text=True, timeout=timeout,
+                )
+
+            probe = _git("log", "--branches", "--not", "--remotes", "--format=%H")
+            has_unpushed = probe.returncode == 0 and bool(probe.stdout.strip())
+            dirty = _git("status", "--porcelain")
+            has_dirty = dirty.returncode == 0 and bool(dirty.stdout.strip())
+            if not has_unpushed and not has_dirty:
+                continue
+
+            rescue_dir = kanban_home() / "audit" / "workspace-rescue"
+            failed_branches: list[str] = []
+            if has_unpushed:
+                refs = _git("for-each-ref", "refs/heads", "--format=%(refname:short)")
+                for branch in filter(None, (b.strip() for b in refs.stdout.splitlines())):
+                    ahead = _git("rev-list", "--count", branch, "--not", "--remotes")
+                    if ahead.returncode != 0 or not ahead.stdout.strip():
+                        failed_branches.append(branch)
+                        continue
+                    if int(ahead.stdout.strip()) == 0:
+                        continue
+                    push = _git("push", "origin", branch, timeout=120)
+                    if push.returncode == 0:
+                        _log.warning(
+                            "Workspace rescue: pushed unpushed branch %r of %s "
+                            "to origin before deleting workspace of task %s",
+                            branch, repo, task_id,
+                        )
+                    else:
+                        failed_branches.append(branch)
+
+            if failed_branches or has_dirty:
+                rescue_dir.mkdir(parents=True, exist_ok=True)
+                stamp = int(time.time())
+                if failed_branches:
+                    bundle = rescue_dir / f"{task_id}-{repo.name}-{stamp}.bundle"
+                    res = _git("bundle", "create", str(bundle), "--all", timeout=180)
+                    if res.returncode == 0:
+                        _log.warning(
+                            "Workspace rescue: push failed for branch(es) %s of %s; "
+                            "saved git bundle to %s before deleting workspace of task %s",
+                            failed_branches, repo, bundle, task_id,
+                        )
+                    else:
+                        _log.error(
+                            "Workspace rescue FAILED for task %s: could not push %s "
+                            "or bundle %s — unpushed commits will be lost: %s",
+                            task_id, failed_branches, repo, res.stderr.strip()[:500],
+                        )
+                if has_dirty:
+                    patch = _git("diff", "HEAD")
+                    if patch.returncode == 0 and patch.stdout:
+                        patch_path = rescue_dir / f"{task_id}-{repo.name}-{stamp}-dirty.patch"
+                        patch_path.write_text(patch.stdout)
+                        _log.warning(
+                            "Workspace rescue: saved uncommitted changes of %s "
+                            "to %s before deleting workspace of task %s",
+                            repo, patch_path, task_id,
+                        )
+    except Exception:
+        pass  # best-effort — never block cleanup
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 
@@ -3874,6 +3970,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # completion would unconditionally ``shutil.rmtree`` that path
             # and silently delete the user's source data.
             if _is_managed_scratch_path(wp):
+                _rescue_unpushed_git_work(wp, task_id)
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Removed scratch workspace: %s", wp)
             else:
@@ -3928,6 +4025,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             import shutil
             wp = Path(row["workspace_path"])
             if wp.is_dir() and _is_managed_scratch_path(wp):
+                _rescue_unpushed_git_work(wp, parent_id)
                 shutil.rmtree(wp, ignore_errors=True)
                 _log.debug("Deferred cleanup: removed parent %s scratch workspace: %s", parent_id, wp)
     except Exception:

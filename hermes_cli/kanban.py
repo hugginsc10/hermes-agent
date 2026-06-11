@@ -2708,6 +2708,7 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             # Safety: never delete outside the scratch root.
             continue
         if path.exists() and path.is_dir():
+            kb._rescue_unpushed_git_work(path, row["id"])
             shutil.rmtree(path, ignore_errors=True)
             removed_ws += 1
 
