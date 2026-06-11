@@ -136,6 +136,63 @@ _GATEWAY_SECRET_PATTERNS = (
 )
 
 
+def _gateway_disabled_value(raw: str) -> bool:
+    return bool(re.fullmatch(r"(?:0|off|false|none|disable|disabled)", raw.strip(), re.IGNORECASE))
+
+
+def _central_approval_telegram_target() -> Optional[str]:
+    """Return the opt-in central Telegram target for exec approvals."""
+    raw = (
+        os.getenv("GATEWAY_APPROVAL_TELEGRAM_TARGET", "").strip()
+        or os.getenv("HERMES_APPROVALS_TELEGRAM_TARGET", "").strip()
+        or os.getenv("SWARM_APPROVAL_TELEGRAM_TARGET", "").strip()
+    )
+    if not raw or _gateway_disabled_value(raw):
+        return None
+    return raw
+
+
+def _parse_telegram_numeric_target(target: str) -> Optional[Dict[str, str]]:
+    """Parse telegram:<chat_id>[:thread_id] targets used for approval fanout."""
+    match = re.fullmatch(r"telegram:(-?\d+)(?::(\d+))?", target.strip())
+    if not match:
+        return None
+    parsed = {"chat_id": match.group(1)}
+    if match.group(2):
+        parsed["thread_id"] = match.group(2)
+    return parsed
+
+
+def _workspace_web_push_endpoint() -> Optional[str]:
+    """Return the opt-in Workspace web-push API endpoint for approval fanout."""
+    raw = (
+        os.getenv("GATEWAY_APPROVAL_WEB_PUSH_ENDPOINT", "").strip()
+        or os.getenv("HERMES_WORKSPACE_WEB_PUSH_ENDPOINT", "").strip()
+    )
+    if not raw or _gateway_disabled_value(raw):
+        return None
+
+    from urllib.parse import urlparse
+
+    parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        logger.warning("Approval web-push endpoint must be an absolute http(s) URL: %s", raw)
+        return None
+    if parsed.username or parsed.password:
+        logger.warning("Approval web-push endpoint must not include credentials: %s", raw)
+        return None
+    return raw
+
+
+def _approval_push_body(command: str, description: str, session_key: str) -> str:
+    cmd_preview = command[:500] + "..." if len(command) > 500 else command
+    return _redact_gateway_user_facing_secrets(
+        f"Reason: {description}\n"
+        f"Session: {session_key}\n\n"
+        f"{cmd_preview}"
+    )
+
+
 def _ensure_windows_gateway_venv_imports() -> None:
     """Make detached Windows gateway runs see the Hermes venv packages.
 
