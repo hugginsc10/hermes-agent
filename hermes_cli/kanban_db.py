@@ -3869,7 +3869,12 @@ def _rescue_unpushed_git_work(wp: Path, task_id: str) -> None:
                 continue
 
             rescue_dir = kanban_home() / "audit" / "workspace-rescue"
+            stamp = int(time.time())
+            origin_url = _git("remote", "get-url", "origin").stdout.strip()
+            pushed_branches: list[dict[str, str]] = []
             failed_branches: list[str] = []
+            bundle_path: Optional[Path] = None
+            patch_path: Optional[Path] = None
             if has_unpushed:
                 refs = _git("for-each-ref", "refs/heads", "--format=%(refname:short)")
                 for branch in filter(None, (b.strip() for b in refs.stdout.splitlines())):
@@ -3881,6 +3886,8 @@ def _rescue_unpushed_git_work(wp: Path, task_id: str) -> None:
                         continue
                     push = _git("push", "origin", branch, timeout=120)
                     if push.returncode == 0:
+                        tip = _git("rev-parse", branch).stdout.strip()
+                        pushed_branches.append({"branch": branch, "commit": tip})
                         _log.warning(
                             "Workspace rescue: pushed unpushed branch %r of %s "
                             "to origin before deleting workspace of task %s",
@@ -3891,11 +3898,11 @@ def _rescue_unpushed_git_work(wp: Path, task_id: str) -> None:
 
             if failed_branches or has_dirty:
                 rescue_dir.mkdir(parents=True, exist_ok=True)
-                stamp = int(time.time())
                 if failed_branches:
                     bundle = rescue_dir / f"{task_id}-{repo.name}-{stamp}.bundle"
                     res = _git("bundle", "create", str(bundle), "--all", timeout=180)
                     if res.returncode == 0:
+                        bundle_path = bundle
                         _log.warning(
                             "Workspace rescue: push failed for branch(es) %s of %s; "
                             "saved git bundle to %s before deleting workspace of task %s",
@@ -3917,8 +3924,52 @@ def _rescue_unpushed_git_work(wp: Path, task_id: str) -> None:
                             "to %s before deleting workspace of task %s",
                             repo, patch_path, task_id,
                         )
+
+            # Manifest: machine-readable record of what was rescued and
+            # where, consumed by build_worker_context() so a future run
+            # of this task can resume from the rescued work instead of
+            # starting over.
+            if pushed_branches or bundle_path or patch_path:
+                rescue_dir.mkdir(parents=True, exist_ok=True)
+                manifest = {
+                    "task_id": task_id,
+                    "repo_name": repo.name,
+                    "origin_url": origin_url,
+                    "rescued_at": stamp,
+                    "pushed_branches": pushed_branches,
+                    "bundle": str(bundle_path) if bundle_path else None,
+                    "dirty_patch": str(patch_path) if patch_path else None,
+                }
+                manifest_path = rescue_dir / f"{task_id}-{repo.name}-{stamp}.json"
+                manifest_path.write_text(json.dumps(manifest, indent=2))
     except Exception:
         pass  # best-effort — never block cleanup
+
+
+def find_rescue_manifests(task_id: str) -> list[dict[str, Any]]:
+    """Return rescue manifests for *task_id*, newest first.
+
+    Each manifest records git work preserved by
+    :func:`_rescue_unpushed_git_work` before a prior workspace of this
+    task was deleted: branches pushed to the clone origin, a fallback
+    git bundle, and/or a dirty-worktree patch. Best-effort: unreadable
+    manifests are skipped.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        rescue_dir = kanban_home() / "audit" / "workspace-rescue"
+        if not rescue_dir.is_dir():
+            return out
+        for mp in sorted(rescue_dir.glob(f"{task_id}-*.json"), reverse=True):
+            try:
+                data = json.loads(mp.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(data, dict) and data.get("task_id") == task_id:
+                out.append(data)
+    except Exception:
+        pass
+    return out
 
 
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
@@ -7094,6 +7145,45 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             size_str = f", {size_kb} KB" if size_kb else ""
             ctype = f", {att.content_type}" if att.content_type else ""
             lines.append(f"- `{att.filename}`{ctype}{size_str} → `{att.stored_path}`")
+        lines.append("")
+
+    # Resume state — git work rescued from prior deleted workspaces of
+    # this task. Surfaced so a retrying worker continues from the
+    # rescued commits instead of redoing the work from scratch.
+    manifests = find_rescue_manifests(task_id)
+    if manifests:
+        lines.append("## Resume state (rescued git work from prior runs)")
+        lines.append(
+            "A previous run of this task committed git work that was "
+            "preserved before its workspace was deleted. RESUME from this "
+            "work instead of starting over:"
+        )
+        for m in manifests[:3]:
+            when = time.strftime(
+                "%Y-%m-%d %H:%M", time.localtime(m.get("rescued_at", 0))
+            )
+            repo_name = m.get("repo_name", "repo")
+            for pb in m.get("pushed_branches") or []:
+                lines.append(
+                    f"- [{when}] branch `{pb.get('branch')}` "
+                    f"(commit `{str(pb.get('commit', ''))[:12]}`) was pushed to "
+                    f"`{m.get('origin_url')}` — clone/fetch that remote in your "
+                    f"workspace and check the branch out to continue."
+                )
+            if m.get("bundle"):
+                lines.append(
+                    f"- [{when}] git bundle with all refs of `{repo_name}` saved "
+                    f"at `{m['bundle']}` — restore with "
+                    f"`git clone {m['bundle']} {repo_name}` (or `git fetch <bundle> <branch>` "
+                    f"into an existing clone), then continue from the rescued branch."
+                )
+            if m.get("dirty_patch"):
+                lines.append(
+                    f"- [{when}] uncommitted changes saved as patch at "
+                    f"`{m['dirty_patch']}` — review and `git apply` if still relevant."
+                )
+        if len(manifests) > 3:
+            lines.append(f"- … plus {len(manifests) - 3} older rescue record(s).")
         lines.append("")
 
     # Prior attempts — show closed runs so a retrying worker sees the

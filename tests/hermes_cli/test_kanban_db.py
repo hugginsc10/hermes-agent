@@ -4468,3 +4468,55 @@ def test_rescue_never_raises_on_non_git_dir(kanban_home):
     (workspace / "notes.txt").write_text("not a repo")
     # Must not raise.
     kb._rescue_unpushed_git_work(workspace, "t_plain")
+
+
+# ---------------------------------------------------------------------------
+# Resume-from-rescue (manifests + worker context)
+# ---------------------------------------------------------------------------
+
+def test_rescue_writes_manifest_on_push(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    manifests = kb.find_rescue_manifests("t_rescue")
+    assert manifests, "expected a rescue manifest after successful push"
+    m = manifests[0]
+    assert m["task_id"] == "t_rescue"
+    branches = [pb["branch"] for pb in m["pushed_branches"]]
+    assert "fix/t_rescue-feature" in branches
+    assert m["origin_url"] == str(origin)
+    assert m["bundle"] is None
+
+
+def test_rescue_writes_manifest_on_bundle_fallback(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    _run_git(clone, "remote", "set-url", "origin", str(workspace / "missing.git"))
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    manifests = kb.find_rescue_manifests("t_rescue")
+    assert manifests
+    assert manifests[0]["bundle"], "manifest should record the bundle path"
+    assert Path(manifests[0]["bundle"]).exists()
+
+
+def test_find_rescue_manifests_ignores_other_tasks(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    assert kb.find_rescue_manifests("t_other") == []
+
+
+def test_worker_context_includes_resume_state(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resumable work")
+    kb._rescue_unpushed_git_work(workspace, task_id)
+    with kb.connect() as conn:
+        text = kb.build_worker_context(conn, task_id)
+    assert "Resume state" in text
+    assert "fix/t_rescue-feature" in text
+    assert "RESUME from this work" in text
+
+
+def test_worker_context_no_resume_section_without_rescues(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fresh task")
+        text = kb.build_worker_context(conn, task_id)
+    assert "Resume state" not in text
