@@ -4372,3 +4372,151 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Workspace rescue (_rescue_unpushed_git_work)
+# ---------------------------------------------------------------------------
+
+import subprocess as _sp
+
+
+def _run_git(cwd, *args):
+    # Neutralize any machine-global hooks (e.g. commit-msg policy) for hermetic tests.
+    res = _sp.run(["git", "-C", str(cwd), "-c", "core.hooksPath=/var/empty", *args],
+                  capture_output=True, text=True)
+    assert res.returncode == 0, f"git {args} failed: {res.stderr}"
+    return res.stdout.strip()
+
+
+@pytest.fixture
+def scratch_repo_with_unpushed(kanban_home, tmp_path):
+    """A scratch-style clone with one unpushed branch and a bare local origin."""
+    origin = tmp_path / "origin.git"
+    origin.mkdir()
+    _run_git(origin, "init", "--bare", "--initial-branch=main")
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run_git(seed, "init", "--initial-branch=main")
+    _run_git(seed, "config", "user.email", "test@example.com")
+    _run_git(seed, "config", "user.name", "Test")
+    (seed / "README.md").write_text("seed\n")
+    _run_git(seed, "add", "README.md")
+    _run_git(seed, "commit", "-m", "chore: init seed repo")
+    _run_git(seed, "remote", "add", "origin", str(origin))
+    _run_git(seed, "push", "origin", "main")
+
+    workspace = kanban_home / "kanban" / "workspaces" / "t_rescue"
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    _sp.run(["git", "clone", str(origin), str(workspace / "repo")],
+            capture_output=True, text=True, check=True)
+    clone = workspace / "repo"
+    _run_git(clone, "config", "user.email", "test@example.com")
+    _run_git(clone, "config", "user.name", "Test")
+    _run_git(clone, "checkout", "-b", "fix/t_rescue-feature")
+    (clone / "fix.txt").write_text("unpushed work\n")
+    _run_git(clone, "add", "fix.txt")
+    _run_git(clone, "commit", "-m", "fix: unpushed work")
+    return workspace, clone, origin
+
+
+def test_rescue_pushes_unpushed_branch_to_origin(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    branches = _run_git(origin, "for-each-ref", "refs/heads",
+                        "--format=%(refname:short)")
+    assert "fix/t_rescue-feature" in branches.splitlines()
+
+
+def test_rescue_bundles_when_push_fails(scratch_repo_with_unpushed, kanban_home):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    # Break the remote so push fails.
+    _run_git(clone, "remote", "set-url", "origin", str(workspace / "missing.git"))
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    rescue_dir = kb.kanban_home() / "audit" / "workspace-rescue"
+    bundles = list(rescue_dir.glob("t_rescue-*.bundle"))
+    assert bundles, "expected a git bundle fallback when push fails"
+    # The bundle must contain the unpushed commit.
+    verify = _sp.run(["git", "bundle", "list-heads", str(bundles[0])],
+                     capture_output=True, text=True)
+    assert verify.returncode == 0
+    assert "fix/t_rescue-feature" in verify.stdout
+
+
+def test_rescue_saves_dirty_worktree_patch(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    (clone / "fix.txt").write_text("uncommitted edit\n")
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    rescue_dir = kb.kanban_home() / "audit" / "workspace-rescue"
+    patches = list(rescue_dir.glob("t_rescue-*-dirty.patch"))
+    assert patches, "expected a dirty-worktree patch"
+    assert "uncommitted edit" in patches[0].read_text()
+
+
+def test_rescue_noop_on_clean_pushed_workspace(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    _run_git(clone, "push", "origin", "fix/t_rescue-feature")
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    rescue_dir = kb.kanban_home() / "audit" / "workspace-rescue"
+    assert not rescue_dir.exists(), "no rescue artifacts expected for clean workspace"
+
+
+def test_rescue_never_raises_on_non_git_dir(kanban_home):
+    workspace = kanban_home / "kanban" / "workspaces" / "t_plain"
+    workspace.mkdir(parents=True)
+    (workspace / "notes.txt").write_text("not a repo")
+    # Must not raise.
+    kb._rescue_unpushed_git_work(workspace, "t_plain")
+
+
+# ---------------------------------------------------------------------------
+# Resume-from-rescue (manifests + worker context)
+# ---------------------------------------------------------------------------
+
+def test_rescue_writes_manifest_on_push(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    manifests = kb.find_rescue_manifests("t_rescue")
+    assert manifests, "expected a rescue manifest after successful push"
+    m = manifests[0]
+    assert m["task_id"] == "t_rescue"
+    branches = [pb["branch"] for pb in m["pushed_branches"]]
+    assert "fix/t_rescue-feature" in branches
+    assert m["origin_url"] == str(origin)
+    assert m["bundle"] is None
+
+
+def test_rescue_writes_manifest_on_bundle_fallback(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    _run_git(clone, "remote", "set-url", "origin", str(workspace / "missing.git"))
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    manifests = kb.find_rescue_manifests("t_rescue")
+    assert manifests
+    assert manifests[0]["bundle"], "manifest should record the bundle path"
+    assert Path(manifests[0]["bundle"]).exists()
+
+
+def test_find_rescue_manifests_ignores_other_tasks(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    kb._rescue_unpushed_git_work(workspace, "t_rescue")
+    assert kb.find_rescue_manifests("t_other") == []
+
+
+def test_worker_context_includes_resume_state(scratch_repo_with_unpushed):
+    workspace, clone, origin = scratch_repo_with_unpushed
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="resumable work")
+    kb._rescue_unpushed_git_work(workspace, task_id)
+    with kb.connect() as conn:
+        text = kb.build_worker_context(conn, task_id)
+    assert "Resume state" in text
+    assert "fix/t_rescue-feature" in text
+    assert "RESUME from this work" in text
+
+
+def test_worker_context_no_resume_section_without_rescues(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="fresh task")
+        text = kb.build_worker_context(conn, task_id)
+    assert "Resume state" not in text
