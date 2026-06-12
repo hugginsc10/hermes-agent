@@ -1130,6 +1130,79 @@ def test_auth_remove_env_seeded_does_not_resurrect(tmp_path, monkeypatch):
     assert not pool.has_credentials()
 
 
+def test_auth_remove_xai_oauth_profile_mode_clears_global_singleton(
+    tmp_path, monkeypatch
+):
+    """Removing profile-visible xAI OAuth must clear the canonical global store.
+
+    xAI OAuth is shared across profiles because refresh tokens are rotating
+    single-use credentials. A profile-mode removal that only clears the
+    profile store leaves providers.xai-oauth in the global store, allowing a
+    second profile to re-seed the global pool from stale singleton tokens.
+    """
+    home = tmp_path / "home"
+    global_home = home / ".hermes"
+    profile_home = global_home / "profiles" / "builder"
+    other_profile_home = global_home / "profiles" / "reviewer"
+    profile_home.mkdir(parents=True)
+    other_profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    global_auth = {
+        "version": 1,
+        "active_provider": "xai-oauth",
+        "providers": {
+            "xai-oauth": {
+                "tokens": {
+                    "access_token": "xai-access",
+                    "refresh_token": "xai-refresh",
+                },
+                "last_refresh": "2026-06-12T00:00:00Z",
+                "auth_mode": "oauth_pkce",
+            }
+        },
+        "credential_pool": {
+            "xai-oauth": [
+                {
+                    "id": "xai-1",
+                    "label": "loopback_pkce",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "loopback_pkce",
+                    "access_token": "xai-access",
+                    "refresh_token": "xai-refresh",
+                }
+            ]
+        },
+    }
+    (global_home / "auth.json").write_text(json.dumps(global_auth, indent=2))
+    (profile_home / "auth.json").write_text(json.dumps({"version": 1}, indent=2))
+
+    from hermes_cli.auth_commands import auth_remove_command
+
+    class _Args:
+        provider = "xai-oauth"
+        target = "1"
+
+    auth_remove_command(_Args())
+
+    global_payload = json.loads((global_home / "auth.json").read_text())
+    assert "xai-oauth" not in global_payload.get("providers", {})
+    assert "xai-oauth" not in global_payload.get("credential_pool", {})
+    assert global_payload.get("active_provider") is None
+
+    profile_payload = json.loads((profile_home / "auth.json").read_text())
+    assert profile_payload["suppressed_sources"]["xai-oauth"] == ["loopback_pkce"]
+
+    monkeypatch.setenv("HERMES_HOME", str(other_profile_home))
+    from agent.credential_pool import load_pool
+
+    assert not load_pool("xai-oauth").has_credentials()
+    global_payload_after_other = json.loads((global_home / "auth.json").read_text())
+    assert "xai-oauth" not in global_payload_after_other.get("credential_pool", {})
+
+
 def test_auth_remove_manual_entry_does_not_touch_env(tmp_path, monkeypatch):
     """Removing a manually-added credential should NOT touch .env."""
     hermes_home = tmp_path / "hermes"

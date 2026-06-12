@@ -643,11 +643,12 @@ class CredentialPool:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
 
         xAI OAuth refresh tokens are single-use.  When another Hermes process
-        (or another profile sharing the same auth.json) refreshes the token,
-        it writes the new pair to ``providers["xai-oauth"]["tokens"]`` under
-        ``_auth_store_lock``.  Without this resync, our in-memory pool entry
-        keeps the consumed refresh_token and the next ``_refresh_entry`` call
-        would replay it and get a ``refresh_token_reused``-style 4xx.
+        (or another profile sharing the same global auth.json) refreshes the token,
+        it writes the new pair to the canonical global
+        ``providers["xai-oauth"]["tokens"]`` under ``_xai_oauth_store_lock``.
+        Without this resync, our in-memory pool entry keeps the consumed
+        refresh_token and the next ``_refresh_entry`` call would replay it and
+        get a ``refresh_token_reused``-style 4xx.
 
         Only applies to entries seeded from the singleton (``loopback_pkce``);
         manually added entries (``manual:xai_pkce``) are independent
@@ -656,8 +657,8 @@ class CredentialPool:
         if self.provider != "xai-oauth" or entry.source != "loopback_pkce":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            with auth_mod._xai_oauth_store_lock():
+                auth_store = auth_mod._load_xai_oauth_auth_store()
                 state = _load_provider_state(auth_store, "xai-oauth")
             if not isinstance(state, dict):
                 return entry
@@ -795,6 +796,27 @@ class CredentialPool:
         # added pool entries (source="manual:*") are independent credentials
         # and must not write back to the singleton.
         if entry.source not in {"device_code", "loopback_pkce"}:
+            return
+        if self.provider == "xai-oauth":
+            try:
+                with auth_mod._xai_oauth_store_lock():
+                    auth_store = auth_mod._load_xai_oauth_auth_store()
+                    state = _load_provider_state(auth_store, "xai-oauth")
+                    if not isinstance(state, dict):
+                        return
+                    tokens = state.get("tokens")
+                    if not isinstance(tokens, dict):
+                        return
+                    tokens["access_token"] = entry.access_token
+                    if entry.refresh_token:
+                        tokens["refresh_token"] = entry.refresh_token
+                    if entry.last_refresh:
+                        state["last_refresh"] = entry.last_refresh
+                    _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
+                    auth_mod._save_xai_oauth_auth_store(auth_store)
+                auth_mod._purge_profile_local_xai_oauth_state()
+            except Exception as exc:
+                logger.debug("Failed to sync xai-oauth pool entry back to auth store: %s", exc)
             return
         try:
             with _auth_store_lock():
@@ -1013,8 +1035,8 @@ class CredentialPool:
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        with auth_mod._xai_oauth_store_lock():
+                            auth_store = auth_mod._load_xai_oauth_auth_store()
                             state = _load_provider_state(auth_store, "xai-oauth") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1033,8 +1055,8 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
+                                        auth_mod._save_xai_oauth_auth_store(auth_store)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc

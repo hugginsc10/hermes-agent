@@ -281,8 +281,30 @@ def _remove_xai_oauth_loopback_pkce(provider: str, removed) -> RemovalResult:
     falls through to "unregistered → nothing to clean up" (correct —
     manual entries are pool-only).
     """
+    from hermes_cli import auth as auth_mod
+
     result = RemovalResult()
-    if _clear_auth_store_provider(provider):
+    cleared = False
+    with auth_mod._xai_oauth_store_lock():
+        auth_store = auth_mod._load_xai_oauth_auth_store()
+        providers_dict = auth_store.get("providers")
+        if isinstance(providers_dict, dict) and provider in providers_dict:
+            del providers_dict[provider]
+            cleared = True
+
+        pool_dict = auth_store.get("credential_pool")
+        if isinstance(pool_dict, dict) and provider in pool_dict:
+            del pool_dict[provider]
+            cleared = True
+
+        if auth_store.get("active_provider") == provider:
+            auth_store["active_provider"] = None
+            cleared = True
+
+        if cleared:
+            auth_mod._save_xai_oauth_auth_store(auth_store)
+
+    if cleared:
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     result.hints.append(
         "Run `hermes model` → xAI Grok OAuth (SuperGrok / Premium+) to re-authenticate if needed."
