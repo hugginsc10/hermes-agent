@@ -595,8 +595,11 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            # Codex is a canonical-global provider: read the singleton from the
+            # canonical global store under the canonical lock so a profile never
+            # syncs from (or forks) a profile-local copy.
+            with auth_mod._canonical_oauth_store_lock():
+                auth_store = auth_mod._load_canonical_auth_store()
                 state = _load_provider_state(auth_store, "openai-codex")
             if not isinstance(state, dict):
                 return entry
@@ -643,11 +646,12 @@ class CredentialPool:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
 
         xAI OAuth refresh tokens are single-use.  When another Hermes process
-        (or another profile sharing the same auth.json) refreshes the token,
-        it writes the new pair to ``providers["xai-oauth"]["tokens"]`` under
-        ``_auth_store_lock``.  Without this resync, our in-memory pool entry
-        keeps the consumed refresh_token and the next ``_refresh_entry`` call
-        would replay it and get a ``refresh_token_reused``-style 4xx.
+        (or another profile sharing the same global auth.json) refreshes the token,
+        it writes the new pair to the canonical global
+        ``providers["xai-oauth"]["tokens"]`` under ``_xai_oauth_store_lock``.
+        Without this resync, our in-memory pool entry keeps the consumed
+        refresh_token and the next ``_refresh_entry`` call would replay it and
+        get a ``refresh_token_reused``-style 4xx.
 
         Only applies to entries seeded from the singleton (``loopback_pkce``);
         manually added entries (``manual:xai_pkce``) are independent
@@ -656,8 +660,8 @@ class CredentialPool:
         if self.provider != "xai-oauth" or entry.source != "loopback_pkce":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            with auth_mod._xai_oauth_store_lock():
+                auth_store = auth_mod._load_xai_oauth_auth_store()
                 state = _load_provider_state(auth_store, "xai-oauth")
             if not isinstance(state, dict):
                 return entry
@@ -796,6 +800,34 @@ class CredentialPool:
         # and must not write back to the singleton.
         if entry.source not in {"device_code", "loopback_pkce"}:
             return
+        # Canonical-global providers (xAI, Codex): write the singleton back to
+        # the canonical global store under the canonical lock and purge any
+        # stale profile-local copy, so a profile sync-back can never fork the
+        # rotating single-use refresh-token family.
+        if auth_mod.is_canonical_global_provider(self.provider):
+            try:
+                with auth_mod._canonical_oauth_store_lock():
+                    auth_store = auth_mod._load_canonical_auth_store()
+                    state = _load_provider_state(auth_store, self.provider)
+                    if not isinstance(state, dict):
+                        return
+                    tokens = state.get("tokens")
+                    if not isinstance(tokens, dict):
+                        return
+                    tokens["access_token"] = entry.access_token
+                    if entry.refresh_token:
+                        tokens["refresh_token"] = entry.refresh_token
+                    if entry.last_refresh:
+                        state["last_refresh"] = entry.last_refresh
+                    _store_provider_state(auth_store, self.provider, state, set_active=False)
+                    auth_mod._save_canonical_auth_store(auth_store)
+                auth_mod._purge_profile_local_provider_state(self.provider)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to sync %s pool entry back to canonical auth store: %s",
+                    self.provider, exc,
+                )
+            return
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
@@ -822,42 +854,94 @@ class CredentialPool:
                         state["inference_base_url"] = entry.inference_base_url
                     _store_provider_state(auth_store, "nous", state, set_active=False)
 
-                elif self.provider == "openai-codex":
-                    state = _load_provider_state(auth_store, "openai-codex")
-                    if not isinstance(state, dict):
-                        return
-                    tokens = state.get("tokens")
-                    if not isinstance(tokens, dict):
-                        return
-                    tokens["access_token"] = entry.access_token
-                    if entry.refresh_token:
-                        tokens["refresh_token"] = entry.refresh_token
-                    if entry.last_refresh:
-                        state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "openai-codex", state, set_active=False)
-
-                elif self.provider == "xai-oauth":
-                    state = _load_provider_state(auth_store, "xai-oauth")
-                    if not isinstance(state, dict):
-                        return
-                    tokens = state.get("tokens")
-                    if not isinstance(tokens, dict):
-                        return
-                    tokens["access_token"] = entry.access_token
-                    if entry.refresh_token:
-                        tokens["refresh_token"] = entry.refresh_token
-                    if entry.last_refresh:
-                        state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
-
                 else:
+                    # openai-codex and xai-oauth are canonical-global providers
+                    # handled by the early return above; everything else has no
+                    # singleton to sync back to.
                     return
 
                 _save_auth_store(auth_store)
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
+    def _resync_canonical_entry_from_pool_disk(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt this entry's freshest tokens from the on-disk pool (by id).
+
+        Complements ``_sync_codex/_xai_oauth_entry_from_auth_store``: those
+        re-read the ``providers.<id>`` singleton (where an interactive
+        ``hermes auth`` re-login writes), but a *concurrent process's*
+        ``_refresh_entry`` write-back lands in the credential *pool* keyed by
+        entry id, not the singleton.  Manual canonical entries
+        (``manual:device_code`` / ``manual:xai_pkce``) are skipped by the
+        singleton sync, so without this re-read a second process that cached the
+        consumed ``RT0`` before acquiring the flock would replay it and trip
+        ``refresh_token_reused``.  Re-read the pool by id under the (already
+        held, reentrant) canonical lock and adopt rotated tokens so the caller's
+        expiry re-check can skip the POST.  Must be called with the canonical
+        lock held; ``read_credential_pool`` re-enters it cheaply.
+        """
+        if not auth_mod.is_canonical_global_provider(self.provider):
+            return entry
+        try:
+            disk_entries = auth_mod.read_credential_pool(self.provider) or []
+            if not isinstance(disk_entries, list):
+                return entry
+            for raw in disk_entries:
+                if not isinstance(raw, dict) or raw.get("id") != entry.id:
+                    continue
+                disk_access = raw.get("access_token") or ""
+                disk_refresh = raw.get("refresh_token") or ""
+                entry_access = entry.access_token or ""
+                entry_refresh = entry.refresh_token or ""
+                if disk_access and (
+                    disk_access != entry_access
+                    or (disk_refresh and disk_refresh != entry_refresh)
+                ):
+                    logger.debug(
+                        "Pool entry %s: adopting rotated %s tokens from the "
+                        "on-disk pool (refreshed by another process)",
+                        entry.id,
+                        self.provider,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=disk_access,
+                        refresh_token=disk_refresh or entry.refresh_token,
+                        last_refresh=raw.get("last_refresh") or entry.last_refresh,
+                    )
+                    self._replace_entry(entry, updated)
+                    return updated
+                break
+        except Exception as exc:
+            logger.debug(
+                "Failed to resync %s entry from on-disk pool: %s",
+                self.provider,
+                exc,
+            )
+        return entry
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        # Canonical-global providers (openai-codex, xai-oauth) share a single
+        # global auth.json singleton across every Hermes process/profile, and
+        # their refresh tokens are single-use: the provider rotates RT0->RT1 and
+        # revokes the whole token family the instant a consumed RT0 is replayed
+        # (refresh_token_reused).  The per-process ``self._lock`` taken by
+        # select() does NOT serialise across processes, so without a
+        # cross-process gate two processes can both read RT0, both POST it, and
+        # the second POST kills the login.  Hold the canonical flock across the
+        # ENTIRE read -> HTTP-refresh -> write-back sequence so a second process
+        # blocks until the first finishes and then RE-READS the rotated RT1
+        # instead of replaying the consumed RT0.  The lock is reentrant per
+        # thread (see auth._file_lock), so the inner _sync_* helpers that take
+        # the same lock nest safely without an early release.
+        if auth_mod.is_canonical_global_provider(self.provider):
+            with auth_mod._canonical_oauth_store_lock():
+                return self._refresh_entry_locked(entry, force=force)
+        return self._refresh_entry_locked(entry, force=force)
+
+    def _refresh_entry_locked(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -891,42 +975,70 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another Hermes
-                # process sharing the same auth.json singleton would otherwise
-                # trigger ``refresh_token_reused`` on the next POST.
+                # Re-read the singleton under the canonical lock (held by
+                # _refresh_entry) and adopt fresher tokens from auth.json before
+                # spending the refresh_token.  A single-use token consumed by
+                # another Hermes process sharing the same auth.json singleton
+                # would otherwise trigger ``refresh_token_reused`` on the next
+                # POST.  The lock is already held, so _sync_* reenters cheaply.
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                refreshed = auth_mod.refresh_codex_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
-                )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                # Also adopt a token a concurrent process rotated into the
+                # on-disk pool by id (the _refresh_entry write-back target),
+                # covering manual:device_code entries the singleton sync skips.
+                entry = self._resync_canonical_entry_from_pool_disk(entry)
+                # Re-check expiry after the in-lock re-read: if a concurrent
+                # process already rotated RT0->RT1 while we waited on the flock,
+                # adopt its fresh token and skip the HTTP POST entirely instead
+                # of replaying the now-consumed RT0.  ``force`` callers still
+                # refresh, but they now spend the freshest token under the lock.
+                if not force and not self._entry_needs_refresh(entry):
+                    updated = entry
+                else:
+                    refreshed = auth_mod.refresh_codex_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                    )
             elif self.provider == "xai-oauth":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another
-                # process (or another profile sharing the singleton) would
-                # otherwise trigger ``refresh_token_reused`` on the next
-                # POST.  Only meaningful for singleton-seeded entries.
+                # Re-read the singleton under the canonical lock (held by
+                # _refresh_entry) and adopt fresher tokens from auth.json before
+                # spending the refresh_token.  A single-use token consumed by
+                # another process (or another profile sharing the singleton)
+                # would otherwise trigger ``refresh_token_reused`` on the next
+                # POST.  Only meaningful for singleton-seeded entries; the lock
+                # is already held, so _sync_* reenters cheaply.
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                refreshed = auth_mod.refresh_xai_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
-                )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                # Also adopt a token a concurrent process rotated into the
+                # on-disk pool by id (the _refresh_entry write-back target),
+                # covering manual:xai_pkce entries the singleton sync skips.
+                entry = self._resync_canonical_entry_from_pool_disk(entry)
+                # Re-check expiry after the in-lock re-read: if a concurrent
+                # process already rotated RT0->RT1 while we waited on the flock,
+                # adopt its fresh token and skip the HTTP POST entirely instead
+                # of replaying the now-consumed RT0.  ``force`` callers still
+                # refresh, but they now spend the freshest token under the lock.
+                if not force and not self._entry_needs_refresh(entry):
+                    updated = entry
+                else:
+                    refreshed = auth_mod.refresh_xai_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                    )
             elif self.provider == "nous":
                 synced = self._sync_nous_entry_from_auth_store(entry)
                 if synced is not entry:
@@ -1013,8 +1125,8 @@ class CredentialPool:
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        with auth_mod._xai_oauth_store_lock():
+                            auth_store = auth_mod._load_xai_oauth_auth_store()
                             state = _load_provider_state(auth_store, "xai-oauth") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1033,8 +1145,8 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
+                                        auth_mod._save_xai_oauth_auth_store(auth_store)
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
@@ -1079,8 +1191,13 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        # Codex is canonical-global: quarantine the dead token
+                        # in the canonical global store under the canonical lock
+                        # (never a profile-local copy) and purge any stale
+                        # profile-local remnant so the next session fails fast
+                        # without re-seeding revoked credentials.
+                        with auth_mod._canonical_oauth_store_lock():
+                            auth_store = auth_mod._load_canonical_auth_store()
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1099,8 +1216,9 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        _store_provider_state(auth_store, "openai-codex", state, set_active=False)
+                                        auth_mod._save_canonical_auth_store(auth_store)
+                        auth_mod._purge_profile_local_provider_state("openai-codex")
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc

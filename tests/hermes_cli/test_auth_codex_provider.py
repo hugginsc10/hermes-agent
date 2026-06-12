@@ -10,15 +10,19 @@ import pytest
 
 from hermes_cli.auth import (
     AuthError,
+    CANONICAL_GLOBAL_PROVIDERS,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
     _read_codex_tokens,
     _save_codex_tokens,
     _import_codex_cli_tokens,
     _login_openai_codex,
+    is_canonical_global_provider,
+    read_credential_pool,
     refresh_codex_oauth_pure,
     resolve_codex_runtime_credentials,
     resolve_provider,
+    write_credential_pool,
 )
 
 
@@ -1008,3 +1012,190 @@ def test_login_openai_codex_force_new_login_skips_existing_reuse_prompt(monkeypa
 
     assert called["device_login"] == 1
     assert called["tokens"]["access_token"] == "fresh-at"
+
+
+# ---------------------------------------------------------------------------
+# Single-source consolidation: openai-codex is a canonical-global provider.
+#
+# Codex OAuth refresh tokens are rotating single-use credentials.  Profile
+# auth.json copies that refresh on divergent schedules replay a consumed token
+# and trip upstream reuse-detection, revoking the whole family (this burned
+# through multiple Codex logins).  These tests prove codex now reads/writes the
+# canonical GLOBAL store, never forks a profile-local copy, and re-reads before
+# spending a refresh token — mirroring the proven xAI single-source suite.
+# ---------------------------------------------------------------------------
+
+
+def _setup_global_codex_auth(root: Path, *, access_token: str, refresh_token: str) -> Path:
+    """Write a codex singleton into the global-root auth.json."""
+    root.mkdir(parents=True, exist_ok=True)
+    auth_store = {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                },
+                "last_refresh": "2026-06-12T00:00:00Z",
+                "auth_mode": "chatgpt",
+            },
+        },
+    }
+    auth_file = root / "auth.json"
+    auth_file.write_text(json.dumps(auth_store, indent=2))
+    return auth_file
+
+
+def test_codex_is_canonical_global_provider():
+    assert "openai-codex" in CANONICAL_GLOBAL_PROVIDERS
+    assert is_canonical_global_provider("openai-codex") is True
+    assert is_canonical_global_provider("nous") is False
+
+
+def test_codex_uses_global_store_and_purges_profile_copy(tmp_path, monkeypatch):
+    """Profile-mode codex reads the global singleton and a save lands globally.
+
+    A stale profile-local copy must be purged on save so the read-side
+    per-provider shadowing can never serve a forked token.
+    """
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    global_auth = _setup_global_codex_auth(
+        root, access_token="global-access", refresh_token="global-refresh"
+    )
+    profile_auth = _setup_hermes_auth(
+        profile_home, access_token="stale-profile-access", refresh_token="stale-profile-refresh"
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    data = _read_codex_tokens()
+    assert data["tokens"]["access_token"] == "global-access"
+    assert data["tokens"]["refresh_token"] == "global-refresh"
+
+    _save_codex_tokens(
+        {"access_token": "rotated-global-access", "refresh_token": "rotated-global-refresh"}
+    )
+
+    global_store = json.loads(global_auth.read_text())
+    assert (
+        global_store["providers"]["openai-codex"]["tokens"]["refresh_token"]
+        == "rotated-global-refresh"
+    )
+    profile_store = json.loads(profile_auth.read_text())
+    assert "openai-codex" not in profile_store.get("providers", {})
+
+
+def test_codex_credential_pool_uses_global_store_not_profile_copy(tmp_path, monkeypatch):
+    """Codex pool writes land in the global store; profile keeps no copy."""
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    _setup_global_codex_auth(root, access_token="global-access", refresh_token="global-refresh")
+    _setup_hermes_auth(profile_home, access_token="stale-access", refresh_token="stale-refresh")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    write_credential_pool(
+        "openai-codex",
+        [
+            {
+                "id": "global-pool",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "access_token": "global-access",
+                "refresh_token": "global-refresh",
+                "priority": 0,
+                "label": "global",
+                "last_refresh": "2026-06-12T00:00:00Z",
+            }
+        ],
+    )
+
+    entries = read_credential_pool("openai-codex")
+    assert entries[0]["access_token"] == "global-access"
+    assert entries[0]["refresh_token"] == "global-refresh"
+    # No codex copy persisted into the profile auth.json.
+    assert "openai-codex" not in (profile_home / "auth.json").read_text()
+
+
+def test_codex_pool_preserves_independent_accounts(tmp_path, monkeypatch):
+    """Dedupe must collapse only true forks, never distinct codex accounts.
+
+    Two entries with DIFFERENT refresh tokens are independent ChatGPT accounts
+    (#39236) and must both survive; two entries SHARING a refresh token are
+    forks of one rotating credential and collapse to the freshest.
+    """
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    profile_home.mkdir(parents=True, exist_ok=True)
+    _setup_global_codex_auth(root, access_token="seed", refresh_token="seed")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    write_credential_pool(
+        "openai-codex",
+        [
+            {
+                "id": "acct-a", "label": "work", "source": "manual:device_code",
+                "auth_type": "oauth", "access_token": "at-a", "refresh_token": "rt-a",
+                "priority": 0, "last_refresh": "2026-06-01T00:00:00Z",
+            },
+            {
+                "id": "acct-b", "label": "personal", "source": "manual:device_code",
+                "auth_type": "oauth", "access_token": "at-b", "refresh_token": "rt-b",
+                "priority": 1, "last_refresh": "2026-06-02T00:00:00Z",
+            },
+            {
+                "id": "acct-a-fork", "label": "work-fork", "source": "device_code",
+                "auth_type": "oauth", "access_token": "at-a-newer", "refresh_token": "rt-a",
+                "priority": 2, "last_refresh": "2026-06-10T00:00:00Z",
+            },
+        ],
+    )
+
+    entries = read_credential_pool("openai-codex")
+    refresh_tokens = sorted(e["refresh_token"] for e in entries)
+    assert refresh_tokens == ["rt-a", "rt-b"]  # both accounts kept, fork folded
+    # The rt-a family collapsed to the freshest member.
+    rt_a_entry = next(e for e in entries if e["refresh_token"] == "rt-a")
+    assert rt_a_entry["access_token"] == "at-a-newer"
+
+
+def test_codex_locked_refresh_rereads_global_store_before_spending_refresh_token(
+    tmp_path, monkeypatch
+):
+    """The second consumer must adopt the rotated token, not replay a dead one.
+
+    Two sequential resolves of an expiring codex token must trigger exactly ONE
+    upstream refresh: the first rotates the single-use token under the canonical
+    lock and the second re-reads the fresh token instead of replaying the
+    consumed one (which would trip refresh_token_reused).
+    """
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    fresh = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_global_codex_auth(root, access_token=expiring, refresh_token="rt-old")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    presented_refresh_tokens = []
+
+    def _fake_refresh(tokens, timeout_seconds):
+        presented_refresh_tokens.append(tokens["refresh_token"])
+        updated = dict(tokens)
+        updated["access_token"] = fresh
+        updated["refresh_token"] = "rt-new"
+        _save_codex_tokens(updated)
+        return updated
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    first = resolve_codex_runtime_credentials()
+    second = resolve_codex_runtime_credentials()
+
+    assert first["api_key"] == fresh
+    assert second["api_key"] == fresh
+    assert presented_refresh_tokens == ["rt-old"]
