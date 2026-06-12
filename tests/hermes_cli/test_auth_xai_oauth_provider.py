@@ -27,9 +27,11 @@ from hermes_cli.auth import (
     _xai_validate_loopback_redirect_uri,
     format_auth_error,
     get_xai_oauth_auth_status,
+    read_credential_pool,
     refresh_xai_oauth_pure,
     resolve_provider,
     resolve_xai_oauth_runtime_credentials,
+    write_credential_pool,
 )
 
 
@@ -433,6 +435,111 @@ def test_save_and_read_xai_oauth_tokens_roundtrip(tmp_path, monkeypatch):
     assert data["tokens"]["refresh_token"] == "rt-1"
     assert data["redirect_uri"] == "http://127.0.0.1:56121/callback"
     assert data["discovery"]["token_endpoint"] == "https://auth.x.ai/oauth2/token"
+
+
+def test_xai_oauth_uses_global_store_and_purges_profile_copy(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    global_auth = _setup_hermes_auth(
+        root,
+        access_token="global-access",
+        refresh_token="global-refresh",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    profile_auth = _setup_hermes_auth(
+        profile_home,
+        access_token="stale-profile-access",
+        refresh_token="stale-profile-refresh",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    data = _read_xai_oauth_tokens()
+    assert data["tokens"]["access_token"] == "global-access"
+    assert data["tokens"]["refresh_token"] == "global-refresh"
+
+    _save_xai_oauth_tokens(
+        {
+            "access_token": "rotated-global-access",
+            "refresh_token": "rotated-global-refresh",
+            "id_token": "",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        },
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+
+    global_store = json.loads(global_auth.read_text())
+    assert global_store["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "rotated-global-refresh"
+    profile_store = json.loads(profile_auth.read_text())
+    assert "xai-oauth" not in profile_store.get("providers", {})
+
+
+def test_xai_credential_pool_uses_global_store_not_profile_copy(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    _setup_hermes_auth(root, access_token="global-access", refresh_token="global-refresh")
+    _setup_hermes_auth(profile_home, access_token="stale-access", refresh_token="stale-refresh")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    write_credential_pool(
+        "xai-oauth",
+        [
+            {
+                "id": "global-pool",
+                "source": "loopback_pkce",
+                "auth_type": "oauth",
+                "access_token": "global-access",
+                "refresh_token": "global-refresh",
+                "priority": 0,
+                "label": "global",
+            }
+        ],
+    )
+
+    entries = read_credential_pool("xai-oauth")
+    assert entries[0]["access_token"] == "global-access"
+    assert entries[0]["refresh_token"] == "global-refresh"
+    assert not (profile_home / "auth.json").read_text().count("xai-oauth")
+
+
+def test_xai_locked_refresh_rereads_global_store_before_spending_refresh_token(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    fresh = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_hermes_auth(
+        root,
+        access_token=expiring,
+        refresh_token="rt-old",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    presented_refresh_tokens = []
+
+    def _fake_refresh(tokens, **kwargs):
+        presented_refresh_tokens.append(tokens["refresh_token"])
+        updated = dict(tokens)
+        updated["access_token"] = fresh
+        updated["refresh_token"] = "rt-new"
+        _save_xai_oauth_tokens(
+            updated,
+            discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+        )
+        return updated
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _fake_refresh)
+
+    first = resolve_xai_oauth_runtime_credentials()
+    second = resolve_xai_oauth_runtime_credentials()
+
+    assert first["api_key"] == fresh
+    assert second["api_key"] == fresh
+    assert presented_refresh_tokens == ["rt-old"]
 
 
 def test_read_xai_oauth_tokens_missing(tmp_path, monkeypatch):
