@@ -864,6 +864,64 @@ class CredentialPool:
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
+    def _resync_canonical_entry_from_pool_disk(
+        self, entry: PooledCredential
+    ) -> PooledCredential:
+        """Adopt this entry's freshest tokens from the on-disk pool (by id).
+
+        Complements ``_sync_codex/_xai_oauth_entry_from_auth_store``: those
+        re-read the ``providers.<id>`` singleton (where an interactive
+        ``hermes auth`` re-login writes), but a *concurrent process's*
+        ``_refresh_entry`` write-back lands in the credential *pool* keyed by
+        entry id, not the singleton.  Manual canonical entries
+        (``manual:device_code`` / ``manual:xai_pkce``) are skipped by the
+        singleton sync, so without this re-read a second process that cached the
+        consumed ``RT0`` before acquiring the flock would replay it and trip
+        ``refresh_token_reused``.  Re-read the pool by id under the (already
+        held, reentrant) canonical lock and adopt rotated tokens so the caller's
+        expiry re-check can skip the POST.  Must be called with the canonical
+        lock held; ``read_credential_pool`` re-enters it cheaply.
+        """
+        if not auth_mod.is_canonical_global_provider(self.provider):
+            return entry
+        try:
+            disk_entries = auth_mod.read_credential_pool(self.provider) or []
+            if not isinstance(disk_entries, list):
+                return entry
+            for raw in disk_entries:
+                if not isinstance(raw, dict) or raw.get("id") != entry.id:
+                    continue
+                disk_access = raw.get("access_token") or ""
+                disk_refresh = raw.get("refresh_token") or ""
+                entry_access = entry.access_token or ""
+                entry_refresh = entry.refresh_token or ""
+                if disk_access and (
+                    disk_access != entry_access
+                    or (disk_refresh and disk_refresh != entry_refresh)
+                ):
+                    logger.debug(
+                        "Pool entry %s: adopting rotated %s tokens from the "
+                        "on-disk pool (refreshed by another process)",
+                        entry.id,
+                        self.provider,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=disk_access,
+                        refresh_token=disk_refresh or entry.refresh_token,
+                        last_refresh=raw.get("last_refresh") or entry.last_refresh,
+                    )
+                    self._replace_entry(entry, updated)
+                    return updated
+                break
+        except Exception as exc:
+            logger.debug(
+                "Failed to resync %s entry from on-disk pool: %s",
+                self.provider,
+                exc,
+            )
+        return entry
+
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         # Canonical-global providers (openai-codex, xai-oauth) share a single
         # global auth.json singleton across every Hermes process/profile, and
@@ -926,6 +984,10 @@ class CredentialPool:
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
+                # Also adopt a token a concurrent process rotated into the
+                # on-disk pool by id (the _refresh_entry write-back target),
+                # covering manual:device_code entries the singleton sync skips.
+                entry = self._resync_canonical_entry_from_pool_disk(entry)
                 # Re-check expiry after the in-lock re-read: if a concurrent
                 # process already rotated RT0->RT1 while we waited on the flock,
                 # adopt its fresh token and skip the HTTP POST entirely instead
@@ -955,6 +1017,10 @@ class CredentialPool:
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
+                # Also adopt a token a concurrent process rotated into the
+                # on-disk pool by id (the _refresh_entry write-back target),
+                # covering manual:xai_pkce entries the singleton sync skips.
+                entry = self._resync_canonical_entry_from_pool_disk(entry)
                 # Re-check expiry after the in-lock re-read: if a concurrent
                 # process already rotated RT0->RT1 while we waited on the flock,
                 # adopt its fresh token and skip the HTTP POST entirely instead
