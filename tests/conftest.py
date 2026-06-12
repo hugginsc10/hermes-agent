@@ -573,8 +573,20 @@ def _install_session_home_backstop() -> None:
     os.environ[HERMES_TEST_REAL_DEFAULT_HOME_ENV] = str(
         hermes_constants._get_platform_default_hermes_home()
     )
+    _original_default = hermes_constants._get_platform_default_hermes_home
+    _real_machine_default = _original_default()
     _sandbox = Path(_session_home_dir)
-    hermes_constants._get_platform_default_hermes_home = lambda: _sandbox
+
+    def _sandboxed_platform_default() -> Path:
+        # Tests that mock Path.home()/LOCALAPPDATA still exercise the genuine
+        # default-path logic (tests/test_hermes_constants.py asserts it);
+        # only the bona-fide machine home is fenced off to the sandbox.
+        computed = _original_default()
+        if computed == _real_machine_default:
+            return _sandbox
+        return computed
+
+    hermes_constants._get_platform_default_hermes_home = _sandboxed_platform_default
 
 
 def pytest_unconfigure(config):  # noqa: D401 — pytest hook
