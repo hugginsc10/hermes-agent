@@ -1180,16 +1180,18 @@ class TestHermesHomeIsolation:
         assert "hermes_test" in hermes_home, "Should point to test temp dir"
 
     def test_get_hermes_home_fallback(self):
-        """Without HERMES_HOME set, falls back to the active OS home."""
+        """Without HERMES_HOME set, the fallback must stay inside the test
+        session sandbox — never the real account home. (The previous version
+        asserted the real-home fallback, which is exactly the behavior that
+        let a test run clobber the production gateway_state.json; see
+        tests/conftest.py::_install_session_home_backstop.)"""
         from tools.tirith_security import _get_hermes_home
+        session_home = os.environ["HERMES_TEST_SESSION_HOME"]
+        real_home = os.path.join(os.path.expanduser("~"), ".hermes")
         with patch.dict(os.environ, {}, clear=True):
-            # Remove HERMES_HOME entirely. With HOME also absent, expanduser
-            # falls back to the account database; compute expected under the
-            # same environment instead of after patch.dict restores HOME.
-            os.environ.pop("HERMES_HOME", None)
-            expected = os.path.join(os.path.expanduser("~"), ".hermes")
             result = _get_hermes_home()
-        assert result == expected
+        assert result != real_home
+        assert result == session_home
 
 
 # ---------------------------------------------------------------------------

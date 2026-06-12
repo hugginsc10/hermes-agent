@@ -27,10 +27,15 @@ from hermes_cli.config import (
 
 class TestGetHermesHome:
     def test_default_path(self):
+        """With HERMES_HOME unset, the fallback must stay inside the test
+        session sandbox — never the real account home (see
+        tests/conftest.py::_install_session_home_backstop)."""
+        session_home = Path(os.environ["HERMES_TEST_SESSION_HOME"])
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("HERMES_HOME", None)
             home = get_hermes_home()
-            assert home == Path.home() / ".hermes"
+            assert home != Path.home() / ".hermes"
+            assert home == session_home
 
     def test_env_override(self):
         with patch.dict(os.environ, {"HERMES_HOME": "/custom/path"}):

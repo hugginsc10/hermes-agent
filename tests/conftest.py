@@ -21,7 +21,9 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -524,9 +526,80 @@ def _ensure_current_event_loop(request):
 
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 
+# ---------------------------------------------------------------------------
+# Session-level Hermes-home backstops.
+#
+# The per-test ``_hermetic_environment`` fixture redirects HERMES_HOME with
+# monkeypatch — but env-based isolation has two structural gaps, both
+# observed in the wild when a kanban worker's run of
+# tests/gateway/test_feishu.py merged its own pid/argv into the operator's
+# real ~/.hermes/gateway_state.json via write_runtime_status's
+# read-modify-write:
+#
+# 1. ``patch.dict(os.environ, {...}, clear=True)`` blocks (test_feishu alone
+#    has ~105) wipe HERMES_HOME *inside* the test window. Adapter lifecycle
+#    code that fires there (e.g. FeishuAdapter.connect → _mark_connected →
+#    write_runtime_status) falls through get_hermes_home() to the platform
+#    default — the real home. Audit-hook trace: env HERMES_HOME=None,
+#    contextvar override=None, environ size=2 at the moment of the write.
+# 2. Between tests, monkeypatch restores the outer environment, so leaked
+#    background machinery (SDK reconnect threads, atexit hooks) would also
+#    resolve the real home.
+#
+# Two session-scoped backstops close both gaps without disturbing tests that
+# legitimately set their own HERMES_HOME (env still wins over the default):
+#   a. os.environ["HERMES_HOME"] points at a session sandbox (covers gap 2);
+#   b. hermes_constants._get_platform_default_hermes_home is patched to the
+#      same sandbox, so the *fallback* of get_hermes_home() can never reach
+#      the real home (covers gap 1). No test asserts the real default path.
+# ---------------------------------------------------------------------------
+HERMES_TEST_SESSION_HOME_ENV = "HERMES_TEST_SESSION_HOME"
+HERMES_TEST_REAL_DEFAULT_HOME_ENV = "HERMES_TEST_REAL_DEFAULT_HOME"
+_session_home_dir = None
+
+
+def _install_session_home_backstop() -> None:
+    global _session_home_dir
+    if _session_home_dir is not None:
+        return
+    _session_home_dir = tempfile.mkdtemp(prefix="hermes-test-session-home-")
+    os.environ["HERMES_HOME"] = _session_home_dir
+    os.environ[HERMES_TEST_SESSION_HOME_ENV] = _session_home_dir
+
+    import hermes_constants
+
+    # Record the real default before neutering it, so regression tests can
+    # assert nothing resolves there (tests/gateway/test_hermetic_state.py).
+    os.environ[HERMES_TEST_REAL_DEFAULT_HOME_ENV] = str(
+        hermes_constants._get_platform_default_hermes_home()
+    )
+    _original_default = hermes_constants._get_platform_default_hermes_home
+    _real_machine_default = _original_default()
+    _sandbox = Path(_session_home_dir)
+
+    def _sandboxed_platform_default() -> Path:
+        # Tests that mock Path.home()/LOCALAPPDATA still exercise the genuine
+        # default-path logic (tests/test_hermes_constants.py asserts it);
+        # only the bona-fide machine home is fenced off to the sandbox.
+        computed = _original_default()
+        if computed == _real_machine_default:
+            return _sandbox
+        return computed
+
+    hermes_constants._get_platform_default_hermes_home = _sandboxed_platform_default
+
+
+def pytest_unconfigure(config):  # noqa: D401 — pytest hook
+    """Best-effort cleanup of the session HERMES_HOME sandbox."""
+    global _session_home_dir
+    if _session_home_dir is not None:
+        shutil.rmtree(_session_home_dir, ignore_errors=True)
+        _session_home_dir = None
+
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
-    """Register markers used by hermetic conftest."""
+    """Register markers and arm the session HERMES_HOME backstop."""
+    _install_session_home_backstop()
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
