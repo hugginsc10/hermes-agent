@@ -1203,6 +1203,84 @@ def test_auth_remove_xai_oauth_profile_mode_clears_global_singleton(
     assert "xai-oauth" not in global_payload_after_other.get("credential_pool", {})
 
 
+def test_auth_remove_codex_profile_mode_clears_global_singleton(
+    tmp_path, monkeypatch
+):
+    """Removing profile-visible Codex must clear the canonical global store.
+
+    openai-codex is a canonical-global provider: its refresh tokens are
+    rotating single-use credentials shared across profiles.  A profile-mode
+    removal that only cleared the profile store would leave the global
+    providers.openai-codex singleton + pool slice intact, letting a second
+    profile re-seed the global pool from stale tokens and re-collide.  This is
+    the codex clone of the xAI reseed-closure regression test.
+    """
+    home = tmp_path / "home"
+    global_home = home / ".hermes"
+    profile_home = global_home / "profiles" / "builder"
+    other_profile_home = global_home / "profiles" / "reviewer"
+    profile_home.mkdir(parents=True)
+    other_profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    # No re-seed from ~/.codex/auth.json during this test.
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+
+    global_auth = {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "codex-access",
+                    "refresh_token": "codex-refresh",
+                },
+                "last_refresh": "2026-06-12T00:00:00Z",
+                "auth_mode": "chatgpt",
+            }
+        },
+        "credential_pool": {
+            "openai-codex": [
+                {
+                    "id": "codex-1",
+                    "label": "openai-codex-oauth",
+                    "auth_type": "oauth",
+                    "priority": 0,
+                    "source": "device_code",
+                    "access_token": "codex-access",
+                    "refresh_token": "codex-refresh",
+                }
+            ]
+        },
+    }
+    (global_home / "auth.json").write_text(json.dumps(global_auth, indent=2))
+    (profile_home / "auth.json").write_text(json.dumps({"version": 1}, indent=2))
+
+    from hermes_cli.auth_commands import auth_remove_command
+
+    class _Args:
+        provider = "openai-codex"
+        target = "1"
+
+    auth_remove_command(_Args())
+
+    global_payload = json.loads((global_home / "auth.json").read_text())
+    assert "openai-codex" not in global_payload.get("providers", {})
+    assert "openai-codex" not in global_payload.get("credential_pool", {})
+    assert global_payload.get("active_provider") is None
+
+    # A second, unsuppressed profile must NOT be able to reseed the global pool.
+    monkeypatch.setenv("HERMES_HOME", str(other_profile_home))
+    from agent.credential_pool import load_pool
+
+    assert not load_pool("openai-codex").has_credentials()
+    global_payload_after_other = json.loads((global_home / "auth.json").read_text())
+    assert "openai-codex" not in global_payload_after_other.get("credential_pool", {})
+
+
 def test_auth_remove_manual_entry_does_not_touch_env(tmp_path, monkeypatch):
     """Removing a manually-added credential should NOT touch .env."""
     hermes_home = tmp_path / "hermes"
