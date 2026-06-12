@@ -2998,3 +2998,265 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
     tokens = auth_payload["providers"]["openai-codex"].get("tokens", {})
     assert tokens.get("access_token") == "old-access-token"
     assert tokens.get("refresh_token") == "old-refresh-token"
+
+
+# ---------------------------------------------------------------------------
+# Concurrent-refresh collision guard (canonical-global providers)
+#
+# Regression for the exact token-death mechanism that killed the xAI and Codex
+# logins: two Hermes processes/profiles share one global auth.json singleton
+# whose refresh tokens are SINGLE-USE.  Before the fix, ``_refresh_entry`` read
+# the refresh token, released the canonical lock, then POSTed it WITHOUT the
+# lock held.  Two consumers could both read RT0, both POST RT0, and the second
+# POST tripped ``refresh_token_reused`` -> the provider revoked the whole token
+# family.  The fix holds the canonical flock across the full
+# read -> HTTP-refresh -> write-back so a second consumer blocks, then re-reads
+# the rotated RT1 instead of replaying the consumed RT0.
+#
+# These tests simulate two independent pool instances (each with its own
+# per-process ``self._lock`` — exactly like two processes) and a fake provider
+# that rotates the refresh token on every successful POST and flags any replay
+# of an already-consumed token.  The real cross-process serialiser exercised is
+# the on-disk ``_canonical_oauth_store_lock`` flock under ``$HERMES_HOME``.
+# ---------------------------------------------------------------------------
+
+
+class _RotatingRefreshProvider:
+    """Fake single-use rotating-RT OAuth provider backed by the on-disk store.
+
+    ``__call__`` matches the ``refresh_<provider>_oauth_pure(access, refresh)``
+    signature.  It treats the refresh token currently persisted in the canonical
+    auth store as the only spendable token; any call that presents a different
+    (already-consumed) refresh token is recorded as a reuse violation and raises
+    a terminal ``refresh_token_reused`` error, mirroring upstream revocation.
+    """
+
+    def __init__(self, auth_json_path, provider_id, *, post_delay=0.05):
+        self._auth_json_path = auth_json_path
+        self._provider_id = provider_id
+        self._post_delay = post_delay
+        self._gen = 0
+        self.calls = []
+        self.reuse_violations = []
+        self._mutex = __import__("threading").Lock()
+
+    def _current_refresh_on_disk(self):
+        payload = json.loads(self._auth_json_path.read_text())
+        return (
+            payload["providers"][self._provider_id]["tokens"].get("refresh_token")
+        )
+
+    def _rotate_on_disk(self, access, refresh):
+        payload = json.loads(self._auth_json_path.read_text())
+        payload["providers"][self._provider_id]["tokens"]["access_token"] = access
+        payload["providers"][self._provider_id]["tokens"]["refresh_token"] = refresh
+        self._auth_json_path.write_text(json.dumps(payload, indent=2))
+
+    def __call__(self, access_token, refresh_token, *args, **kwargs):
+        from hermes_cli.auth import AuthError
+
+        # Widen the race window OUTSIDE the disk mutex so a buggy (lock-free)
+        # implementation has every chance to interleave a second reader here.
+        time.sleep(self._post_delay)
+        with self._mutex:
+            current = self._current_refresh_on_disk()
+            self.calls.append(refresh_token)
+            if refresh_token != current:
+                # A consumed RT was replayed — the exact death mechanism.
+                self.reuse_violations.append(refresh_token)
+                raise AuthError(
+                    "refresh token reuse detected",
+                    provider=self._provider_id,
+                    code="refresh_token_reused",
+                    relogin_required=True,
+                )
+            self._gen += 1
+            new_access = f"access-gen{self._gen}"
+            new_refresh = f"refresh-gen{self._gen}"
+            self._rotate_on_disk(new_access, new_refresh)
+            return {
+                "access_token": new_access,
+                "refresh_token": new_refresh,
+                "last_refresh": "2026-06-12T00:00:00Z",
+            }
+
+
+def _run_concurrent_refresh(provider, auth_store_factory, refresh_attr,
+                            tmp_path, monkeypatch, *, n_consumers=4):
+    import hermes_cli.auth as auth_mod
+    from agent.credential_pool import load_pool
+
+    auth_json = tmp_path / "hermes" / "auth.json"
+    _write_auth_store(tmp_path, auth_store_factory("access-gen0", "refresh-gen0"))
+
+    fake = _RotatingRefreshProvider(auth_json, provider)
+    monkeypatch.setattr(auth_mod, refresh_attr, fake)
+
+    # Each consumer loads its OWN pool instance from the shared singleton —
+    # independent in-memory state and independent per-process self._lock, just
+    # like separate Hermes processes/profiles.
+    pools = [load_pool(provider) for _ in range(n_consumers)]
+    for pool in pools:
+        assert pool.select() is not None
+
+    barrier = __import__("threading").Barrier(n_consumers)
+    results = []
+    errors = []
+
+    def worker(pool):
+        try:
+            barrier.wait()  # release all consumers at once
+            results.append(pool.try_refresh_current())
+        except Exception as exc:  # pragma: no cover - surfaced via assert
+            errors.append(exc)
+
+    threads = [
+        __import__("threading").Thread(target=worker, args=(pool,))
+        for pool in pools
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    return fake, results, errors
+
+
+@pytest.mark.parametrize(
+    "provider,store_factory,refresh_attr",
+    [
+        ("openai-codex", _codex_auth_store, "refresh_codex_oauth_pure"),
+        ("xai-oauth", _xai_auth_store, "refresh_xai_oauth_pure"),
+    ],
+)
+def test_concurrent_refresh_never_replays_consumed_refresh_token(
+    provider, store_factory, refresh_attr, tmp_path, monkeypatch
+):
+    """Two+ simulated consumers must never both spend the same refresh token.
+
+    With the canonical flock held across read->POST->write-back, the consumers
+    serialise: the first rotates RT0->RT1, and every subsequent consumer
+    re-reads the rotated token under the lock before its own POST.  The fake
+    provider asserts that no already-consumed refresh token is ever replayed
+    (zero ``refresh_token_reused`` violations), which is the precise failure
+    that revoked the xAI/Codex token family.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_OAUTH_ACCESS_TOKEN", raising=False)
+
+    fake, results, errors = _run_concurrent_refresh(
+        provider, store_factory, refresh_attr, tmp_path, monkeypatch
+    )
+
+    assert not errors, f"Unexpected worker errors: {errors}"
+    # The core invariant: no consumed refresh token was ever replayed.
+    assert fake.reuse_violations == [], (
+        f"refresh_token_reused would have revoked the {provider} family: "
+        f"replayed tokens={fake.reuse_violations}"
+    )
+    # Every refresh token presented to the provider was the one current on disk
+    # at POST time, and all presented tokens are distinct (strict serialisation
+    # of single-use consumption).
+    assert len(fake.calls) == len(set(fake.calls)), (
+        f"duplicate refresh token spent: {fake.calls}"
+    )
+    # At least one consumer obtained fresh credentials.
+    assert any(r is not None for r in results)
+    # The on-disk singleton ends on a rotated token, never the seed.
+    final = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    final_rt = final["providers"][provider]["tokens"]["refresh_token"]
+    assert final_rt != "refresh-gen0"
+
+
+def test_concurrent_refresh_waiter_skips_post_when_token_already_fresh(
+    tmp_path, monkeypatch
+):
+    """A waiter that blocked on the flock adopts the rotated token and, when it
+    is no longer expiring, skips the HTTP POST entirely (force=False path).
+
+    This exercises the in-lock re-read + re-check-expiry short-circuit: only the
+    first consumer should POST; the second re-reads the freshly rotated,
+    non-expiring access token and returns it without spending a refresh token.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("CODEX_OAUTH_ACCESS_TOKEN", raising=False)
+
+    import hermes_cli.auth as auth_mod
+    from agent.credential_pool import load_pool
+
+    auth_json = tmp_path / "hermes" / "auth.json"
+
+    # Seed with an EXPIRING (past-exp) JWT access token so a refresh is needed.
+    expiring_access = _jwt_with_claims({"exp": int(time.time()) - 10})
+    _write_auth_store(tmp_path, _codex_auth_store(expiring_access, "refresh-gen0"))
+
+    # The fake rotates to a FRESH (far-future exp) JWT access token, so once a
+    # waiter re-reads it under the lock, _entry_needs_refresh() is False and the
+    # waiter must NOT POST again.
+    fresh_access = _jwt_with_claims({"exp": int(time.time()) + 86_400})
+    post_count = {"n": 0}
+    mutex = __import__("threading").Lock()
+
+    def _fake_refresh(access_token, refresh_token, *args, **kwargs):
+        from hermes_cli.auth import AuthError
+
+        time.sleep(0.05)
+        with mutex:
+            payload = json.loads(auth_json.read_text())
+            current = payload["providers"]["openai-codex"]["tokens"]["refresh_token"]
+            if refresh_token != current:
+                raise AuthError(
+                    "refresh token reuse detected",
+                    provider="openai-codex",
+                    code="refresh_token_reused",
+                    relogin_required=True,
+                )
+            post_count["n"] += 1
+            payload["providers"]["openai-codex"]["tokens"]["access_token"] = fresh_access
+            payload["providers"]["openai-codex"]["tokens"]["refresh_token"] = "refresh-gen1"
+            auth_json.write_text(json.dumps(payload, indent=2))
+            return {
+                "access_token": fresh_access,
+                "refresh_token": "refresh-gen1",
+                "last_refresh": "2026-06-12T00:00:00Z",
+            }
+
+    monkeypatch.setattr(auth_mod, "refresh_codex_oauth_pure", _fake_refresh)
+
+    pool_a = load_pool("openai-codex")
+    pool_b = load_pool("openai-codex")
+    assert pool_a.select() is not None
+    assert pool_b.select() is not None
+
+    barrier = __import__("threading").Barrier(2)
+    results = {}
+    errors = []
+
+    def worker(name, pool):
+        try:
+            barrier.wait()
+            # force=False so the in-lock re-check-expiry short-circuit applies.
+            results[name] = pool._refresh_entry(pool.current(), force=False)
+        except Exception as exc:
+            errors.append(exc)
+
+    import threading as _threading
+    ta = _threading.Thread(target=worker, args=("a", pool_a))
+    tb = _threading.Thread(target=worker, args=("b", pool_b))
+    ta.start(); tb.start()
+    ta.join(); tb.join()
+
+    assert not errors, f"Unexpected worker errors: {errors}"
+    # Exactly one consumer spent the single-use refresh token; the other adopted
+    # the rotated fresh token under the lock and skipped the POST.
+    assert post_count["n"] == 1, (
+        f"expected a single POST (waiter should skip), got {post_count['n']}"
+    )
+    # Both consumers end with the fresh, non-expiring access token.
+    for name in ("a", "b"):
+        assert results[name] is not None
+        assert results[name].access_token == fresh_access

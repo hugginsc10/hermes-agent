@@ -1745,14 +1745,17 @@ def test_pool_seeded_entry_sync_back_after_refresh(tmp_path, monkeypatch):
 def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, monkeypatch):
     """Multi-process race: another Hermes process refreshed the singleton
     (rotating the refresh_token) while this process held a stale in-memory
-    pool entry.  ``_refresh_entry`` must adopt the fresher singleton tokens
-    BEFORE spending its own (now-consumed) refresh_token, otherwise the
-    refresh POST would replay the consumed token and fail with
-    ``refresh_token_reused``.
+    pool entry.  ``_refresh_entry`` re-reads the singleton under the canonical
+    lock and adopts the fresher tokens BEFORE spending its own (now-consumed)
+    refresh_token, otherwise the refresh POST would replay the consumed token
+    and fail with ``refresh_token_reused``.
 
-    Mirrors the proactive sync codex/nous already perform for the same
-    reason, and is what makes the pool actually safe to share across
-    profiles + Hermes processes."""
+    Because the adopted access token is itself fresh (not within the refresh
+    skew window), the in-lock re-check-expiry short-circuit means no second
+    refresh POST is spent at all — the consumed token is never replayed and the
+    valid rotated token is used as-is.  This mirrors the locked resolver
+    ``resolve_xai_oauth_runtime_credentials`` and is what makes the pool safe
+    to share across profiles + Hermes processes."""
     from agent.credential_pool import load_pool
 
     hermes_home = tmp_path / "hermes"
@@ -1780,9 +1783,11 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
     final_at = _jwt_with_exp(int(time.time()) + 7200)
 
     def _fake_refresh(access_token, refresh_token, **kwargs):
-        # The pool MUST have adopted the rotated token from auth.json before
-        # POSTing the refresh — otherwise it would replay the stale one.
+        # Safety guard: a POST would only ever be made with the rotated token
+        # (never the consumed ``rt-stale``).  With the rotated access token
+        # already fresh, no POST should happen at all.
         refresh_calls["refresh_token_seen"] = refresh_token
+        assert refresh_token != "rt-stale", "replayed a consumed refresh token"
         return {
             "access_token": final_at,
             "refresh_token": "rt-final",
@@ -1796,8 +1801,12 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
 
     selected = pool.select()
     assert selected is not None
-    assert refresh_calls["refresh_token_seen"] == "rt-rotated-by-other-process"
-    assert selected.access_token == final_at
+    # The consumed ``rt-stale`` was never replayed: the pool adopted the rotated
+    # singleton tokens under the lock.  Since the adopted access token is fresh,
+    # the in-lock expiry re-check short-circuits the refresh POST entirely.
+    assert refresh_calls["refresh_token_seen"] is None
+    assert selected.access_token == other_process_at
+    assert selected.refresh_token == "rt-rotated-by-other-process"
 
 
 def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, monkeypatch):

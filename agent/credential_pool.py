@@ -865,6 +865,25 @@ class CredentialPool:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        # Canonical-global providers (openai-codex, xai-oauth) share a single
+        # global auth.json singleton across every Hermes process/profile, and
+        # their refresh tokens are single-use: the provider rotates RT0->RT1 and
+        # revokes the whole token family the instant a consumed RT0 is replayed
+        # (refresh_token_reused).  The per-process ``self._lock`` taken by
+        # select() does NOT serialise across processes, so without a
+        # cross-process gate two processes can both read RT0, both POST it, and
+        # the second POST kills the login.  Hold the canonical flock across the
+        # ENTIRE read -> HTTP-refresh -> write-back sequence so a second process
+        # blocks until the first finishes and then RE-READS the rotated RT1
+        # instead of replaying the consumed RT0.  The lock is reentrant per
+        # thread (see auth._file_lock), so the inner _sync_* helpers that take
+        # the same lock nest safely without an early release.
+        if auth_mod.is_canonical_global_provider(self.provider):
+            with auth_mod._canonical_oauth_store_lock():
+                return self._refresh_entry_locked(entry, force=force)
+        return self._refresh_entry_locked(entry, force=force)
+
+    def _refresh_entry_locked(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -898,42 +917,62 @@ class CredentialPool:
                     except Exception as wexc:
                         logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another Hermes
-                # process sharing the same auth.json singleton would otherwise
-                # trigger ``refresh_token_reused`` on the next POST.
+                # Re-read the singleton under the canonical lock (held by
+                # _refresh_entry) and adopt fresher tokens from auth.json before
+                # spending the refresh_token.  A single-use token consumed by
+                # another Hermes process sharing the same auth.json singleton
+                # would otherwise trigger ``refresh_token_reused`` on the next
+                # POST.  The lock is already held, so _sync_* reenters cheaply.
                 synced = self._sync_codex_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                refreshed = auth_mod.refresh_codex_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
-                )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                # Re-check expiry after the in-lock re-read: if a concurrent
+                # process already rotated RT0->RT1 while we waited on the flock,
+                # adopt its fresh token and skip the HTTP POST entirely instead
+                # of replaying the now-consumed RT0.  ``force`` callers still
+                # refresh, but they now spend the freshest token under the lock.
+                if not force and not self._entry_needs_refresh(entry):
+                    updated = entry
+                else:
+                    refreshed = auth_mod.refresh_codex_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                    )
             elif self.provider == "xai-oauth":
-                # Adopt fresher tokens from auth.json before spending the
-                # refresh_token — single-use tokens consumed by another
-                # process (or another profile sharing the singleton) would
-                # otherwise trigger ``refresh_token_reused`` on the next
-                # POST.  Only meaningful for singleton-seeded entries.
+                # Re-read the singleton under the canonical lock (held by
+                # _refresh_entry) and adopt fresher tokens from auth.json before
+                # spending the refresh_token.  A single-use token consumed by
+                # another process (or another profile sharing the singleton)
+                # would otherwise trigger ``refresh_token_reused`` on the next
+                # POST.  Only meaningful for singleton-seeded entries; the lock
+                # is already held, so _sync_* reenters cheaply.
                 synced = self._sync_xai_oauth_entry_from_auth_store(entry)
                 if synced is not entry:
                     entry = synced
-                refreshed = auth_mod.refresh_xai_oauth_pure(
-                    entry.access_token,
-                    entry.refresh_token,
-                )
-                updated = replace(
-                    entry,
-                    access_token=refreshed["access_token"],
-                    refresh_token=refreshed["refresh_token"],
-                    last_refresh=refreshed.get("last_refresh"),
-                )
+                # Re-check expiry after the in-lock re-read: if a concurrent
+                # process already rotated RT0->RT1 while we waited on the flock,
+                # adopt its fresh token and skip the HTTP POST entirely instead
+                # of replaying the now-consumed RT0.  ``force`` callers still
+                # refresh, but they now spend the freshest token under the lock.
+                if not force and not self._entry_needs_refresh(entry):
+                    updated = entry
+                else:
+                    refreshed = auth_mod.refresh_xai_oauth_pure(
+                        entry.access_token,
+                        entry.refresh_token,
+                    )
+                    updated = replace(
+                        entry,
+                        access_token=refreshed["access_token"],
+                        refresh_token=refreshed["refresh_token"],
+                        last_refresh=refreshed.get("last_refresh"),
+                    )
             elif self.provider == "nous":
                 synced = self._sync_nous_entry_from_auth_store(entry)
                 if synced is not entry:
