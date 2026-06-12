@@ -580,7 +580,8 @@ def load_cli_config() -> Dict[str, Any]:
     effective_backend = terminal_config.get("env_type", "local")
 
     if effective_backend == "local":
-        terminal_config["cwd"] = os.getcwd()
+        from agent.runtime_cwd import safe_getcwd
+        terminal_config["cwd"] = safe_getcwd()
         defaults["terminal"]["cwd"] = terminal_config["cwd"]
     elif terminal_config.get("cwd") in _CWD_PLACEHOLDERS:
         terminal_config.pop("cwd", None)

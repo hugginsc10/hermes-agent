@@ -4535,3 +4535,52 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_dispatch_records_spawn_attempt_evidence(kanban_home, all_assignees_spawnable):
+    def _spawn(task, ws):
+        return 99999
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="evidence", assignee="worker")
+        res = kb.dispatch_once(conn, spawn_fn=_spawn)
+        assert res.spawned and res.spawned[0][0] == tid
+        run = kb.list_runs(conn, tid)[0]
+        assert run.metadata["attempted_spawn_cwd"] == kb.get_task(conn, tid).workspace_path
+        assert run.metadata["attempted_spawn_log_path"].endswith(f"{tid}.log")
+        assert run.metadata["attempted_spawn_log_start_offset"] == 0
+        assert run.metadata["assignee"] == "worker"
+    finally:
+        conn.close()
+
+
+def test_provider_auth_exit_blocks_with_log_evidence(kanban_home, all_assignees_spawnable):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="auth", assignee="worker")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        kb.set_workspace_path(conn, tid, str(kanban_home / "workspaces" / tid))
+        pid = 987654321
+        kb._set_worker_pid(conn, tid, pid)
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("OpenAI Codex OAuth failed: HTTP 401 token_expired rejected-token\n", encoding="utf-8")
+        kb._record_worker_exit(pid, 1 << 8)
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.last_failure_error and "auth-required/provider-auth" in task.last_failure_error
+        run = kb.list_runs(conn, tid)[0]
+        assert run.outcome == "provider_auth_required"
+        assert run.status == "blocked"
+        assert run.metadata["provider_auth_detail"] == "token_expired"
+        assert "token_expired" in run.metadata["log_excerpt"]
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "provider_auth_required" for e in events)
+    finally:
+        conn.close()
