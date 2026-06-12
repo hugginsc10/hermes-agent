@@ -220,19 +220,54 @@ def _remove_hermes_pkce(provider: str, removed) -> RemovalResult:
 
 
 def _clear_auth_store_provider(provider: str) -> bool:
-    """Delete auth_store.providers[provider].  Returns True if deleted."""
-    from hermes_cli.auth import (
-        _auth_store_lock,
-        _load_auth_store,
-        _save_auth_store,
-    )
+    """Delete a provider's auth-store state.  Returns True if anything changed.
 
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    For canonical-global providers (xAI, Codex), the rotating single-use
+    credential lives ONLY in the canonical global auth.json, and a stale
+    ``providers.<id>`` / ``credential_pool.<id>`` / ``active_provider`` there can
+    re-seed the pool from a divergent profile (the reseed hazard the prior
+    review flagged).  So for those providers we clear ALL three keys in the
+    canonical global store under the canonical lock.  For every other provider
+    we keep the original profile-store ``providers.<id>`` delete.
+    """
+    from hermes_cli import auth as auth_mod
+
+    if auth_mod.is_canonical_global_provider(provider):
+        cleared = False
+        with auth_mod._canonical_oauth_store_lock():
+            auth_store = auth_mod._load_canonical_auth_store()
+            providers_dict = auth_store.get("providers")
+            if isinstance(providers_dict, dict) and provider in providers_dict:
+                del providers_dict[provider]
+                cleared = True
+            # The central dispatcher already removed the TARGET pool entry and
+            # re-persisted the remaining ones (canonical write).  Only drop the
+            # whole pool key when no entries remain — codex may legitimately
+            # hold multiple independent accounts (#39236) and a single-account
+            # removal must not wipe the others.
+            pool_dict = auth_store.get("credential_pool")
+            if isinstance(pool_dict, dict) and provider in pool_dict:
+                remaining = pool_dict.get(provider)
+                if not isinstance(remaining, list) or len(remaining) == 0:
+                    del pool_dict[provider]
+                    cleared = True
+            if auth_store.get("active_provider") == provider:
+                auth_store["active_provider"] = None
+                cleared = True
+            if cleared:
+                auth_mod._save_canonical_auth_store(auth_store)
+        if cleared:
+            # Scrub any stale profile-local remnant so a sibling profile can't
+            # reseed the global pool from a divergent copy after removal.
+            auth_mod._purge_profile_local_provider_state(provider)
+        return cleared
+
+    with auth_mod._auth_store_lock():
+        auth_store = auth_mod._load_auth_store()
         providers_dict = auth_store.get("providers")
         if isinstance(providers_dict, dict) and provider in providers_dict:
             del providers_dict[provider]
-            _save_auth_store(auth_store)
+            auth_mod._save_auth_store(auth_store)
             return True
     return False
 
@@ -281,30 +316,12 @@ def _remove_xai_oauth_loopback_pkce(provider: str, removed) -> RemovalResult:
     falls through to "unregistered → nothing to clean up" (correct —
     manual entries are pool-only).
     """
-    from hermes_cli import auth as auth_mod
-
     result = RemovalResult()
-    cleared = False
-    with auth_mod._xai_oauth_store_lock():
-        auth_store = auth_mod._load_xai_oauth_auth_store()
-        providers_dict = auth_store.get("providers")
-        if isinstance(providers_dict, dict) and provider in providers_dict:
-            del providers_dict[provider]
-            cleared = True
-
-        pool_dict = auth_store.get("credential_pool")
-        if isinstance(pool_dict, dict) and provider in pool_dict:
-            del pool_dict[provider]
-            cleared = True
-
-        if auth_store.get("active_provider") == provider:
-            auth_store["active_provider"] = None
-            cleared = True
-
-        if cleared:
-            auth_mod._save_xai_oauth_auth_store(auth_store)
-
-    if cleared:
+    # xai-oauth is canonical-global: _clear_auth_store_provider clears the
+    # providers singleton, the pool slice, and active_provider in the canonical
+    # global store under the canonical lock, and purges any profile-local
+    # remnant — closing the reseed path a sibling profile could otherwise use.
+    if _clear_auth_store_provider(provider):
         result.cleaned.append(f"Cleared {provider} OAuth tokens from auth store")
     result.hints.append(
         "Run `hermes model` → xAI Grok OAuth (SuperGrok / Premium+) to re-authenticate if needed."

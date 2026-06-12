@@ -595,8 +595,11 @@ class CredentialPool:
         if self.provider != "openai-codex" or entry.source != "device_code":
             return entry
         try:
-            with _auth_store_lock():
-                auth_store = _load_auth_store()
+            # Codex is a canonical-global provider: read the singleton from the
+            # canonical global store under the canonical lock so a profile never
+            # syncs from (or forks) a profile-local copy.
+            with auth_mod._canonical_oauth_store_lock():
+                auth_store = auth_mod._load_canonical_auth_store()
                 state = _load_provider_state(auth_store, "openai-codex")
             if not isinstance(state, dict):
                 return entry
@@ -797,11 +800,15 @@ class CredentialPool:
         # and must not write back to the singleton.
         if entry.source not in {"device_code", "loopback_pkce"}:
             return
-        if self.provider == "xai-oauth":
+        # Canonical-global providers (xAI, Codex): write the singleton back to
+        # the canonical global store under the canonical lock and purge any
+        # stale profile-local copy, so a profile sync-back can never fork the
+        # rotating single-use refresh-token family.
+        if auth_mod.is_canonical_global_provider(self.provider):
             try:
-                with auth_mod._xai_oauth_store_lock():
-                    auth_store = auth_mod._load_xai_oauth_auth_store()
-                    state = _load_provider_state(auth_store, "xai-oauth")
+                with auth_mod._canonical_oauth_store_lock():
+                    auth_store = auth_mod._load_canonical_auth_store()
+                    state = _load_provider_state(auth_store, self.provider)
                     if not isinstance(state, dict):
                         return
                     tokens = state.get("tokens")
@@ -812,11 +819,14 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
-                    auth_mod._save_xai_oauth_auth_store(auth_store)
-                auth_mod._purge_profile_local_xai_oauth_state()
+                    _store_provider_state(auth_store, self.provider, state, set_active=False)
+                    auth_mod._save_canonical_auth_store(auth_store)
+                auth_mod._purge_profile_local_provider_state(self.provider)
             except Exception as exc:
-                logger.debug("Failed to sync xai-oauth pool entry back to auth store: %s", exc)
+                logger.debug(
+                    "Failed to sync %s pool entry back to canonical auth store: %s",
+                    self.provider, exc,
+                )
             return
         try:
             with _auth_store_lock():
@@ -844,35 +854,10 @@ class CredentialPool:
                         state["inference_base_url"] = entry.inference_base_url
                     _store_provider_state(auth_store, "nous", state, set_active=False)
 
-                elif self.provider == "openai-codex":
-                    state = _load_provider_state(auth_store, "openai-codex")
-                    if not isinstance(state, dict):
-                        return
-                    tokens = state.get("tokens")
-                    if not isinstance(tokens, dict):
-                        return
-                    tokens["access_token"] = entry.access_token
-                    if entry.refresh_token:
-                        tokens["refresh_token"] = entry.refresh_token
-                    if entry.last_refresh:
-                        state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "openai-codex", state, set_active=False)
-
-                elif self.provider == "xai-oauth":
-                    state = _load_provider_state(auth_store, "xai-oauth")
-                    if not isinstance(state, dict):
-                        return
-                    tokens = state.get("tokens")
-                    if not isinstance(tokens, dict):
-                        return
-                    tokens["access_token"] = entry.access_token
-                    if entry.refresh_token:
-                        tokens["refresh_token"] = entry.refresh_token
-                    if entry.last_refresh:
-                        state["last_refresh"] = entry.last_refresh
-                    _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
-
                 else:
+                    # openai-codex and xai-oauth are canonical-global providers
+                    # handled by the early return above; everything else has no
+                    # singleton to sync back to.
                     return
 
                 _save_auth_store(auth_store)
@@ -1101,8 +1086,13 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with _auth_store_lock():
-                            auth_store = _load_auth_store()
+                        # Codex is canonical-global: quarantine the dead token
+                        # in the canonical global store under the canonical lock
+                        # (never a profile-local copy) and purge any stale
+                        # profile-local remnant so the next session fails fast
+                        # without re-seeding revoked credentials.
+                        with auth_mod._canonical_oauth_store_lock():
+                            auth_store = auth_mod._load_canonical_auth_store()
                             state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
@@ -1121,8 +1111,9 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        _store_provider_state(auth_store, "openai-codex", state, set_active=False)
+                                        auth_mod._save_canonical_auth_store(auth_store)
+                        auth_mod._purge_profile_local_provider_state("openai-codex")
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
