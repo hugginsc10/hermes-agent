@@ -5474,9 +5474,28 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+# Provider-auth failure signatures. Every arm requires explicit failure
+# context: a bare ``401`` (user ids, line numbers), a bare ``unauthorized``
+# (firewall logs, task descriptions about auth features) or a generic
+# ``invalid token`` (parser/lexer/CSRF errors) must NOT classify a crash
+# as an auth failure — a false positive here suppresses the real crash
+# record and the circuit-breaker accounting for the task.
 _PROVIDER_AUTH_RE = re.compile(
-    r"(?is)(?:\b401\b|unauthorized|token_expired|rejected[-_ ]?token|"
-    r"oauth(?:2)? access token .*validated|invalid[_ ]?token|expired token)"
+    r"(?is)(?:"
+    r"\b401\b[^\n]{0,60}\bunauthorized\b|"
+    r"\bunauthorized\b[^\n]{0,40}\b401\b|"
+    r"\bhttp[^\n]{0,12}\b401\b|"
+    r"\bstatus(?:[ _]code)?\W{0,4}401\b|"
+    r"\berror\W{0,4}401\b|"
+    r"\btoken[_ ]expired\b|"
+    r"\brejected[-_ ]?token\b|"
+    r"\bexpired[_ ](?:access[_ ]|refresh[_ ])?token\b|"
+    r"\binvalid[_ ]?api[_ ]?key\b|"
+    r"\binvalid x-api-key\b|"
+    r"\bauthentication[_ ]?error\b|"
+    r"\boauth(?:2)?\b[^\n]{0,60}\btoken\b[^\n]{0,60}"
+    r"\b(?:invalid|expired|rejected|revoked|not validated|could not be validated)"
+    r")"
 )
 
 
@@ -5484,10 +5503,14 @@ def _provider_auth_failure_detail(text: str) -> Optional[str]:
     if not text or not _PROVIDER_AUTH_RE.search(text):
         return None
     lowered = text.lower()
-    if "token_expired" in lowered:
+    if "token_expired" in lowered or "token expired" in lowered:
         return "token_expired"
-    if "rejected-token" in lowered or "rejected token" in lowered:
+    if "rejected-token" in lowered or "rejected_token" in lowered or "rejected token" in lowered:
         return "rejected-token"
+    if "invalid_api_key" in lowered or "invalid api key" in lowered or "invalid x-api-key" in lowered:
+        return "invalid-api-key"
+    if "authenticationerror" in lowered or "authentication_error" in lowered or "authentication error" in lowered:
+        return "authentication-error"
     if "401" in lowered or "unauthorized" in lowered:
         return "http-401"
     if "oauth" in lowered:
@@ -5620,9 +5643,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 }
             else:
                 protocol_violation = False
+                from agent.redact import redact_sensitive_text
+
                 log_evidence = _worker_log_excerpt_for_task(row["id"])
-                log_excerpt = _compact_log_excerpt(log_evidence)
-                provider_auth_detail = _provider_auth_failure_detail(log_excerpt)
+                # Classify against the full tail read (4096B); the compact
+                # form is only the durable-storage shape. Redact before
+                # persisting — auth-failure tails are exactly where raw
+                # Authorization headers / OAuth error bodies appear, and
+                # run rows are durable. force=True: hard safety boundary,
+                # not subject to the logging redaction preference.
+                provider_auth_detail = _provider_auth_failure_detail(
+                    str(log_evidence.get("log_excerpt") or "")
+                )
+                log_excerpt = redact_sensitive_text(
+                    _compact_log_excerpt(log_evidence), force=True
+                )
                 if kind == "nonzero_exit" and provider_auth_detail:
                     error_text = (
                         "auth-required/provider-auth: worker exited during startup/model call "
@@ -5658,6 +5693,24 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         _append_event(
                             conn, row["id"], event_kind,
                             event_payload,
+                            run_id=run_id,
+                        )
+                        # Sticky block: without a ``blocked`` event row,
+                        # ``_has_sticky_block`` returns False and
+                        # ``recompute_ready`` auto-promotes the task back
+                        # to ready on the very next tick — an invisible
+                        # respawn loop against dead credentials. The
+                        # operator must refresh credentials and unblock.
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {
+                                "reason": (
+                                    f"provider-auth-required: {provider_auth_detail} — "
+                                    "refresh credentials for profile "
+                                    f"{row['claim_lock'] or 'unknown'}"
+                                ),
+                                "source": "detect_crashed_workers",
+                            },
                             run_id=run_id,
                         )
                         crashed.append(row["id"])
