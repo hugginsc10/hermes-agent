@@ -1099,6 +1099,32 @@ def _notify_single_query_session_finalize(cli, *, reason: str = "shutdown") -> N
         _single_query_finalize_attempted_session_ids.add(session_id)
 
 
+def _single_query_exit_code(
+    failed: bool, failure_reason: Optional[str], is_kanban_worker: bool
+) -> int:
+    """Exit code for the single-query (-q) path.
+
+    Mirrors the fully-quiet -Q contract: terminal failure exits 1, except a
+    kanban worker whose run failed purely on a provider quota/billing wall —
+    that exits with the EX_TEMPFAIL sentinel so the dispatcher's reap
+    classifier records ``rate_limited`` and requeues without counting a
+    failure. A fatal pre-turn abort (provider 401, init failure) must never
+    exit 0: workers were recorded as rc=0 protocol violations instead of
+    infra failures (90/110 crashed runs, 2026-06-12 forensics).
+    """
+    if not failed:
+        return 0
+    if is_kanban_worker and failure_reason in ("rate_limit", "billing"):
+        try:
+            from hermes_cli.kanban_db import (
+                KANBAN_RATE_LIMIT_EXIT_CODE as _rl_code,
+            )
+            return int(_rl_code)
+        except Exception:
+            return 1
+    return 1
+
+
 def _finalize_single_query(cli) -> None:
     """Close one-shot CLI resources before releasing the active session lease."""
     try:
@@ -9950,8 +9976,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # leave it False, which is correct — those aren't user interrupts.
         self._last_turn_interrupted = False
 
+        # Terminal failure state for automation callers (single-query -q
+        # exit-code propagation). Early returns below — credential refresh
+        # and agent init — are failures too: a kanban worker that aborts
+        # before its first model turn must not look like a clean exit.
+        self._last_chat_failed = False
+        self._last_chat_failure_reason = None
+
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
+            self._last_chat_failed = True
+            self._last_chat_failure_reason = "auth"
             return None
 
         turn_route = self._resolve_turn_agent_config(message)
@@ -9966,6 +10001,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             runtime_override=turn_route["runtime"],
             request_overrides=turn_route.get("request_overrides"),
         ):
+            self._last_chat_failed = True
             return None
         
         # Route image attachments based on the active model's vision capability.
@@ -10370,6 +10406,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+
+            # Record terminal failure state for automation callers. The
+            # single-query -q path reads this to set its exit code: a fatal
+            # pre-turn abort (provider 401, init failure) previously exited
+            # 0, so kanban workers were recorded as rc=0 protocol violations
+            # instead of infra failures (90/110 crashed runs, 2026-06-12
+            # forensics).
+            self._last_chat_failed = bool(result and result.get("failed"))
+            self._last_chat_failure_reason = (
+                result.get("failure_reason") if result else None
+            )
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
@@ -13920,6 +13967,18 @@ def main(
                 cli._show_security_advisories()
                 cli.chat(query, images=single_query_images or None)
                 cli._print_exit_summary()
+                # Propagate terminal failure to the exit code (the finally
+                # below still runs on sys.exit). Without this, a worker that
+                # aborts before its first model turn exits 0 and the kanban
+                # dispatcher records a protocol violation instead of an
+                # infra failure.
+                _sq_exit = _single_query_exit_code(
+                    getattr(cli, "_last_chat_failed", False),
+                    getattr(cli, "_last_chat_failure_reason", None),
+                    bool(os.environ.get("HERMES_KANBAN_TASK")),
+                )
+                if _sq_exit != 0:
+                    sys.exit(_sq_exit)
         finally:
             _finalize_single_query(cli)
         return
