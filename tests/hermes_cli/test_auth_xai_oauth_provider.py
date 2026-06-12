@@ -27,9 +27,11 @@ from hermes_cli.auth import (
     _xai_validate_loopback_redirect_uri,
     format_auth_error,
     get_xai_oauth_auth_status,
+    read_credential_pool,
     refresh_xai_oauth_pure,
     resolve_provider,
     resolve_xai_oauth_runtime_credentials,
+    write_credential_pool,
 )
 
 
@@ -433,6 +435,111 @@ def test_save_and_read_xai_oauth_tokens_roundtrip(tmp_path, monkeypatch):
     assert data["tokens"]["refresh_token"] == "rt-1"
     assert data["redirect_uri"] == "http://127.0.0.1:56121/callback"
     assert data["discovery"]["token_endpoint"] == "https://auth.x.ai/oauth2/token"
+
+
+def test_xai_oauth_uses_global_store_and_purges_profile_copy(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    global_auth = _setup_hermes_auth(
+        root,
+        access_token="global-access",
+        refresh_token="global-refresh",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    profile_auth = _setup_hermes_auth(
+        profile_home,
+        access_token="stale-profile-access",
+        refresh_token="stale-profile-refresh",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    data = _read_xai_oauth_tokens()
+    assert data["tokens"]["access_token"] == "global-access"
+    assert data["tokens"]["refresh_token"] == "global-refresh"
+
+    _save_xai_oauth_tokens(
+        {
+            "access_token": "rotated-global-access",
+            "refresh_token": "rotated-global-refresh",
+            "id_token": "",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+        },
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+
+    global_store = json.loads(global_auth.read_text())
+    assert global_store["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "rotated-global-refresh"
+    profile_store = json.loads(profile_auth.read_text())
+    assert "xai-oauth" not in profile_store.get("providers", {})
+
+
+def test_xai_credential_pool_uses_global_store_not_profile_copy(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    _setup_hermes_auth(root, access_token="global-access", refresh_token="global-refresh")
+    _setup_hermes_auth(profile_home, access_token="stale-access", refresh_token="stale-refresh")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    write_credential_pool(
+        "xai-oauth",
+        [
+            {
+                "id": "global-pool",
+                "source": "loopback_pkce",
+                "auth_type": "oauth",
+                "access_token": "global-access",
+                "refresh_token": "global-refresh",
+                "priority": 0,
+                "label": "global",
+            }
+        ],
+    )
+
+    entries = read_credential_pool("xai-oauth")
+    assert entries[0]["access_token"] == "global-access"
+    assert entries[0]["refresh_token"] == "global-refresh"
+    assert not (profile_home / "auth.json").read_text().count("xai-oauth")
+
+
+def test_xai_locked_refresh_rereads_global_store_before_spending_refresh_token(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    profile_home = root / "profiles" / "builder"
+    expiring = _jwt_with_exp(int(time.time()) - 10)
+    fresh = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_hermes_auth(
+        root,
+        access_token=expiring,
+        refresh_token="rt-old",
+        discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    presented_refresh_tokens = []
+
+    def _fake_refresh(tokens, **kwargs):
+        presented_refresh_tokens.append(tokens["refresh_token"])
+        updated = dict(tokens)
+        updated["access_token"] = fresh
+        updated["refresh_token"] = "rt-new"
+        _save_xai_oauth_tokens(
+            updated,
+            discovery={"token_endpoint": "https://auth.x.ai/oauth2/token"},
+        )
+        return updated
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_xai_oauth_tokens", _fake_refresh)
+
+    first = resolve_xai_oauth_runtime_credentials()
+    second = resolve_xai_oauth_runtime_credentials()
+
+    assert first["api_key"] == fresh
+    assert second["api_key"] == fresh
+    assert presented_refresh_tokens == ["rt-old"]
 
 
 def test_read_xai_oauth_tokens_missing(tmp_path, monkeypatch):
@@ -1638,14 +1745,17 @@ def test_pool_seeded_entry_sync_back_after_refresh(tmp_path, monkeypatch):
 def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, monkeypatch):
     """Multi-process race: another Hermes process refreshed the singleton
     (rotating the refresh_token) while this process held a stale in-memory
-    pool entry.  ``_refresh_entry`` must adopt the fresher singleton tokens
-    BEFORE spending its own (now-consumed) refresh_token, otherwise the
-    refresh POST would replay the consumed token and fail with
-    ``refresh_token_reused``.
+    pool entry.  ``_refresh_entry`` re-reads the singleton under the canonical
+    lock and adopts the fresher tokens BEFORE spending its own (now-consumed)
+    refresh_token, otherwise the refresh POST would replay the consumed token
+    and fail with ``refresh_token_reused``.
 
-    Mirrors the proactive sync codex/nous already perform for the same
-    reason, and is what makes the pool actually safe to share across
-    profiles + Hermes processes."""
+    Because the adopted access token is itself fresh (not within the refresh
+    skew window), the in-lock re-check-expiry short-circuit means no second
+    refresh POST is spent at all — the consumed token is never replayed and the
+    valid rotated token is used as-is.  This mirrors the locked resolver
+    ``resolve_xai_oauth_runtime_credentials`` and is what makes the pool safe
+    to share across profiles + Hermes processes."""
     from agent.credential_pool import load_pool
 
     hermes_home = tmp_path / "hermes"
@@ -1673,9 +1783,11 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
     final_at = _jwt_with_exp(int(time.time()) + 7200)
 
     def _fake_refresh(access_token, refresh_token, **kwargs):
-        # The pool MUST have adopted the rotated token from auth.json before
-        # POSTing the refresh — otherwise it would replay the stale one.
+        # Safety guard: a POST would only ever be made with the rotated token
+        # (never the consumed ``rt-stale``).  With the rotated access token
+        # already fresh, no POST should happen at all.
         refresh_calls["refresh_token_seen"] = refresh_token
+        assert refresh_token != "rt-stale", "replayed a consumed refresh token"
         return {
             "access_token": final_at,
             "refresh_token": "rt-final",
@@ -1689,8 +1801,12 @@ def test_pool_refresh_adopts_singleton_tokens_when_consumed_elsewhere(tmp_path, 
 
     selected = pool.select()
     assert selected is not None
-    assert refresh_calls["refresh_token_seen"] == "rt-rotated-by-other-process"
-    assert selected.access_token == final_at
+    # The consumed ``rt-stale`` was never replayed: the pool adopted the rotated
+    # singleton tokens under the lock.  Since the adopted access token is fresh,
+    # the in-lock expiry re-check short-circuits the refresh POST entirely.
+    assert refresh_calls["refresh_token_seen"] is None
+    assert selected.access_token == other_process_at
+    assert selected.refresh_token == "rt-rotated-by-other-process"
 
 
 def test_pool_refresh_recovers_when_other_process_already_refreshed(tmp_path, monkeypatch):

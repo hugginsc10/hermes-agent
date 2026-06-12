@@ -945,6 +945,139 @@ def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
+# ---------------------------------------------------------------------------
+# Canonical-global OAuth providers (single-source credential routing)
+# ---------------------------------------------------------------------------
+#
+# Some OAuth providers issue ROTATING SINGLE-USE refresh tokens.  When named
+# profiles keep independent copies of such a credential (profile auth.json),
+# each copy refreshes on its own schedule; two copies refreshing from divergent
+# state replay a consumed refresh token and the provider's reuse-detection
+# revokes the whole token family.  This killed xAI (revoked) and burned through
+# multiple OpenAI Codex logins.
+#
+# The fix is single-source routing: for these providers, ALL profile processes
+# read AND write the canonical GLOBAL root auth.json (never the profile store),
+# serialized by a single per-path lock, so the latest refresh_token lineage is
+# always shared and no profile-local copy can fork it.  Any stale profile-local
+# copy is purged on write.  Classic / custom non-profile HERMES_HOME deployments
+# resolve canonical == local, so this is a no-op there.
+CANONICAL_GLOBAL_PROVIDERS = frozenset({"xai-oauth", "openai-codex"})
+
+
+def is_canonical_global_provider(provider_id: Optional[str]) -> bool:
+    return (provider_id or "").strip() in CANONICAL_GLOBAL_PROVIDERS
+
+
+def _canonical_auth_file_path() -> Path:
+    """Return the canonical auth.json for single-source OAuth providers.
+
+    In profile mode this is the global Hermes root auth.json; in classic /
+    custom-HERMES_HOME mode it is the local auth.json (``_global_auth_file_path``
+    returns ``None`` when profile and root resolve to the same dir).
+    """
+    return _global_auth_file_path() or _auth_file_path()
+
+
+def _canonical_auth_lock_path() -> Path:
+    return _canonical_auth_file_path().with_suffix(".lock")
+
+
+def _is_profile_auth_path(path: Optional[Path] = None) -> bool:
+    profile_path = path or _auth_file_path()
+    canonical_path = _canonical_auth_file_path()
+    try:
+        return profile_path.resolve(strict=False) != canonical_path.resolve(strict=False)
+    except Exception:
+        return profile_path != canonical_path
+
+
+def _purge_profile_local_provider_state(provider_id: str) -> None:
+    """Best-effort cleanup for a stale profile-local copy of *provider_id*.
+
+    Single-source providers must never keep a profile-local credential.  After
+    a canonical-global write we scrub any leftover profile-local
+    ``providers.<id>`` / ``credential_pool.<id>`` / ``active_provider`` /
+    ``suppressed_sources.<id>`` so the read-side per-provider shadowing can
+    never serve a forked copy.  No-op in classic mode (profile == canonical).
+    """
+    if not _is_profile_auth_path():
+        return
+    try:
+        with _auth_store_lock():
+            auth_file = _auth_file_path()
+            if not auth_file.exists():
+                return
+            auth_store = _load_auth_store()
+            changed = False
+            providers = auth_store.get("providers")
+            if isinstance(providers, dict) and providers.pop(provider_id, None) is not None:
+                changed = True
+            pool = auth_store.get("credential_pool")
+            if isinstance(pool, dict) and pool.pop(provider_id, None) is not None:
+                changed = True
+            if auth_store.get("active_provider") == provider_id:
+                auth_store.pop("active_provider", None)
+                changed = True
+            suppressed = auth_store.get("suppressed_sources")
+            if isinstance(suppressed, dict) and suppressed.pop(provider_id, None) is not None:
+                changed = True
+            if changed:
+                _save_auth_store(auth_store)
+    except Exception as exc:
+        logger.debug(
+            "Failed to purge profile-local %s state: %s", provider_id, exc
+        )
+
+
+# Single lock holder for ALL canonical-global providers: xAI and Codex both
+# resolve to the same global auth.json, so they MUST share one flock keyed on
+# that path.  Two independent threading.local holders on the same file path
+# would each grant reentrancy without the other's kernel-level flock, defeating
+# the cross-provider mutual exclusion that prevents concurrent refreshes from
+# colliding on the shared store.
+_canonical_auth_lock_holder = threading.local()
+
+
+@contextmanager
+def _canonical_oauth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    with _file_lock(
+        _canonical_auth_lock_path(),
+        _canonical_auth_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for canonical OAuth auth store lock",
+    ):
+        yield
+
+
+def _load_canonical_auth_store() -> Dict[str, Any]:
+    return _load_auth_store(_canonical_auth_file_path())
+
+
+def _save_canonical_auth_store(auth_store: Dict[str, Any]) -> Path:
+    return _save_auth_store(auth_store, _canonical_auth_file_path())
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible xAI-named aliases.
+#
+# The proven xai single-source patch (t_d13325e8) and its test suite reference
+# these names.  They now delegate to the provider-generic primitives above so
+# there is exactly one implementation.  ``_purge_profile_local_xai_oauth_state``
+# is retained because callers in this module and credential_pool.py still call
+# it by name; new code should call ``_purge_profile_local_provider_state``.
+# ---------------------------------------------------------------------------
+_xai_oauth_auth_file_path = _canonical_auth_file_path
+_xai_oauth_lock_path = _canonical_auth_lock_path
+_xai_oauth_store_lock = _canonical_oauth_store_lock
+_load_xai_oauth_auth_store = _load_canonical_auth_store
+_save_xai_oauth_auth_store = _save_canonical_auth_store
+
+
+def _purge_profile_local_xai_oauth_state() -> None:
+    _purge_profile_local_provider_state("xai-oauth")
+
+
 _auth_lock_holder = threading.local()
 
 
@@ -1079,8 +1212,8 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
-    auth_file = _auth_file_path()
+def _save_auth_store(auth_store: Dict[str, Any], auth_file: Optional[Path] = None) -> Path:
+    auth_file = auth_file or _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1139,6 +1272,18 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     the profile, the profile state fully shadows the global state on the next
     read. See issue #18594 follow-up.
     """
+    if is_canonical_global_provider(provider_id):
+        # Rotating single-use refresh tokens (xAI, Codex).  Profile shadowing
+        # forks token lineages and can trigger upstream reuse revocation, so
+        # these providers always resolve from the canonical global store.
+        store = _load_canonical_auth_store()
+        providers = store.get("providers")
+        if isinstance(providers, dict):
+            state = providers.get(provider_id)
+            if isinstance(state, dict):
+                return dict(state)
+        return None
+
     providers = auth_store.get("providers")
     if isinstance(providers, dict):
         state = providers.get(provider_id)
@@ -1212,7 +1357,63 @@ def get_auth_provider_display_name(provider_id: str) -> str:
     return SERVICE_PROVIDER_NAMES.get(normalized, provider_id)
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def _entry_last_refresh_key(entry: Dict[str, Any]) -> str:
+    return str(entry.get("last_refresh") or "")
+
+
+def _dedupe_canonical_pool_entries(
+    provider_id: str, entries: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Collapse forked copies of a rotating single-use OAuth credential.
+
+    The hazard is the SAME refresh-token family living in multiple pool slots
+    that then refresh independently and trip reuse-detection.  Dedupe rules:
+
+    * ``xai-oauth`` — a single OAuth account.  Collapse to the one freshest
+      entry regardless of source label (mirrors the original t_d13325e8
+      behaviour).
+
+    * ``openai-codex`` — may legitimately hold MULTIPLE independent ChatGPT
+      accounts (``hermes auth add openai-codex``; see #39236).  Only collapse
+      genuine FORKED COPIES of the same rotating credential: entries that share
+      a non-empty ``refresh_token`` are forks and collapse to their freshest
+      member.  Entries with distinct (or absent) refresh tokens are independent
+      grants and are ALL preserved unchanged — losing one would delete a real
+      account.
+
+    Within a shared-refresh-token family the freshest ``last_refresh`` wins.
+    Order is otherwise preserved so this is a no-op for already-distinct pools.
+    """
+    dict_entries = [entry for entry in entries if isinstance(entry, dict)]
+    if not dict_entries:
+        return list(entries)
+
+    if provider_id == "xai-oauth":
+        return [max(dict_entries, key=_entry_last_refresh_key)]
+
+    # openai-codex: collapse only entries that SHARE a non-empty refresh_token
+    # (true forks of one rotating credential).  Entries with a unique or absent
+    # refresh_token are independent accounts and are kept as-is.  We preserve
+    # first-seen order and only fold later forks into the freshest survivor.
+    family_winner_index: Dict[str, int] = {}
+    result: List[Dict[str, Any]] = []
+    for entry in dict_entries:
+        rt = str(entry.get("refresh_token") or "").strip()
+        if not rt:
+            result.append(entry)
+            continue
+        prior_idx = family_winner_index.get(rt)
+        if prior_idx is None:
+            family_winner_index[rt] = len(result)
+            result.append(entry)
+            continue
+        # Same refresh-token family already present — keep whichever is freshest.
+        if _entry_last_refresh_key(entry) > _entry_last_refresh_key(result[prior_idx]):
+            result[prior_idx] = entry
+    return result
+
+
+def read_credential_pool(provider_id: Optional[str] = None) -> Any:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1225,9 +1426,21 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    Writes normally go to the profile.  Canonical-global providers
+    (``xai-oauth``, ``openai-codex``) are the exception: their rotating
+    single-use refresh tokens are always read/written in the canonical global
+    root and any stale profile-local copy is purged on write.
     See issue #18594 follow-up.
     """
+    if is_canonical_global_provider(provider_id):
+        with _canonical_oauth_store_lock():
+            auth_store = _load_canonical_auth_store()
+            pool = auth_store.get("credential_pool")
+            if not isinstance(pool, dict):
+                return []
+            provider_entries = pool.get(provider_id)
+            return list(provider_entries) if isinstance(provider_entries, list) else []
+
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
@@ -1241,7 +1454,20 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
 
     if provider_id is None:
         merged = dict(pool)
+        if _is_profile_auth_path():
+            # Canonical-global providers never read from the profile slice.
+            canonical_pool = _load_canonical_auth_store().get("credential_pool")
+            for canonical_id in CANONICAL_GLOBAL_PROVIDERS:
+                merged.pop(canonical_id, None)
+                if isinstance(canonical_pool, dict):
+                    canonical_entries = canonical_pool.get(canonical_id)
+                    if isinstance(canonical_entries, list) and canonical_entries:
+                        merged[canonical_id] = list(canonical_entries)
         for gp_key, gp_entries in global_pool.items():
+            if gp_key in CANONICAL_GLOBAL_PROVIDERS and _is_profile_auth_path():
+                # Already resolved from the canonical store above; never let the
+                # generic global-fallback re-add a forked profile/global slice.
+                continue
             if not isinstance(gp_entries, list) or not gp_entries:
                 continue
             # Per-provider shadowing: profile wins whenever it has ANY entries.
@@ -1266,6 +1492,25 @@ def write_credential_pool(provider_id: str, entries: List[Dict[str, Any]]) -> Pa
     credentials. Callers may pass raw dictionaries, so sanitize here even when
     ``PooledCredential.to_dict()`` already did the same work upstream.
     """
+    if is_canonical_global_provider(provider_id):
+        with _canonical_oauth_store_lock():
+            auth_store = _load_canonical_auth_store()
+            pool = auth_store.get("credential_pool")
+            if not isinstance(pool, dict):
+                pool = {}
+                auth_store["credential_pool"] = pool
+            pool[provider_id] = _dedupe_canonical_pool_entries(
+                provider_id,
+                [
+                    sanitize_borrowed_credential_payload(entry, provider_id)
+                    if isinstance(entry, dict) else entry
+                    for entry in entries
+                ],
+            )
+            saved = _save_canonical_auth_store(auth_store)
+        _purge_profile_local_provider_state(provider_id)
+        return saved
+
     with _auth_store_lock():
         auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
@@ -3351,12 +3596,17 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
     Raises AuthError if no Codex tokens are stored.
+
+    Codex OAuth refresh tokens are rotating single-use credentials, so the
+    singleton is read from the canonical global store under the canonical lock
+    (no profile-local fork).  ``_load_provider_state`` also resolves Codex from
+    the canonical store, so the store passed here is only a holder.
     """
     if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _canonical_oauth_store_lock():
+            auth_store = _load_canonical_auth_store()
     else:
-        auth_store = _load_auth_store()
+        auth_store = _load_canonical_auth_store()
     state = _load_provider_state(auth_store, "openai-codex")
     if not state:
         raise AuthError(
@@ -3497,11 +3747,17 @@ def _sync_codex_pool_entries(
 
 
 def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
-    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
+    """Save Codex OAuth tokens to the canonical Hermes auth store.
+
+    Codex refresh tokens are rotating single-use credentials, so the singleton
+    and its mirrored pool entries are written to the canonical GLOBAL root under
+    the canonical lock — never a profile-local copy that could fork the token
+    family — and any stale profile-local copy is purged afterward.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _canonical_oauth_store_lock():
+        auth_store = _load_canonical_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
@@ -3514,14 +3770,15 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _store_provider_state(auth_store, "openai-codex", state, set_active=True)
         _sync_codex_pool_entries(
             auth_store,
             tokens,
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_auth_store(auth_store)
+        _save_canonical_auth_store(auth_store)
+    _purge_profile_local_provider_state("openai-codex")
 
 
 def refresh_codex_oauth_pure(
@@ -3751,8 +4008,12 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        # Re-read under lock to avoid racing with other Hermes processes
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        # Re-read under the canonical lock to avoid racing with other Hermes
+        # processes/profiles.  Re-read-after-lock then re-check expiry: another
+        # process may have already rotated the single-use refresh token while we
+        # waited, in which case we adopt its fresh token instead of replaying a
+        # consumed one (which would trip refresh_token_reused).
+        with _canonical_oauth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -3791,8 +4052,8 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _canonical_oauth_store_lock():
+            auth_store = _load_canonical_auth_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             return ""
@@ -3826,10 +4087,10 @@ def _pool_codex_access_token() -> str:
 
 def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     if _lock:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        with _xai_oauth_store_lock():
+            auth_store = _load_xai_oauth_auth_store()
     else:
-        auth_store = _load_auth_store()
+        auth_store = _load_xai_oauth_auth_store()
     state = _load_provider_state(auth_store, "xai-oauth")
     if not state:
         raise AuthError(
@@ -3879,8 +4140,8 @@ def _save_xai_oauth_tokens(
 ) -> None:
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _xai_oauth_store_lock():
+        auth_store = _load_xai_oauth_auth_store()
         state = _load_provider_state(auth_store, "xai-oauth") or {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
@@ -3889,8 +4150,9 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        _save_provider_state(auth_store, "xai-oauth", state)
-        _save_auth_store(auth_store)
+        _store_provider_state(auth_store, "xai-oauth", state, set_active=True)
+        _save_xai_oauth_auth_store(auth_store)
+    _purge_profile_local_xai_oauth_state()
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -4204,7 +4466,7 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
-        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
+        with _xai_oauth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -4231,7 +4493,7 @@ def resolve_xai_oauth_runtime_credentials(
                         # Clear dead tokens from auth.json so subsequent sessions fail fast
                         # without a network retry. Mirrors credential_pool.py quarantine.
                         try:
-                            _q_store = _load_auth_store()
+                            _q_store = _load_xai_oauth_auth_store()
                             _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
                             _q_tokens = dict(_q_state.get("tokens") or {})
                             _q_tokens.pop("access_token", None)
@@ -4246,7 +4508,7 @@ def resolve_xai_oauth_runtime_credentials(
                                 "at": datetime.now(timezone.utc).isoformat(),
                             }
                             _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
-                            _save_auth_store(_q_store)
+                            _save_xai_oauth_auth_store(_q_store)
                         except Exception as _save_exc:
                             logger.debug(
                                 "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
