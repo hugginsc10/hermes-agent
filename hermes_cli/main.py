@@ -1891,7 +1891,8 @@ def _launch_tui(
         "HERMES_PYTHON_SRC_ROOT", str(PROJECT_ROOT)
     )
     env.setdefault("HERMES_PYTHON", sys.executable)
-    env.setdefault("HERMES_CWD", os.getcwd())
+    from agent.runtime_cwd import safe_getcwd
+    env.setdefault("HERMES_CWD", safe_getcwd())
     env.setdefault("NODE_ENV", "development" if tui_dev else "production")
 
     wt_info = None

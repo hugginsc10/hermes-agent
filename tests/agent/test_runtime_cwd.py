@@ -3,8 +3,6 @@
 import os
 from pathlib import Path
 
-import pytest
-
 import agent.runtime_cwd as rt
 from agent.runtime_cwd import (
     clear_session_cwd,
@@ -13,9 +11,6 @@ from agent.runtime_cwd import (
     set_session_cwd,
 )
 
-
-def _raise_oserror(*args, **kwargs):
-    raise OSError("cwd gone")
 
 
 class TestResolveAgentCwd:
@@ -45,14 +40,28 @@ class TestResolveAgentCwd:
         monkeypatch.chdir(tmp_path)
         assert resolve_agent_cwd() == tmp_path
 
-    def test_propagates_oserror_from_getcwd(self, monkeypatch):
-        # The fallback arm calls os.getcwd(), which can raise OSError (deleted cwd).
-        # The resolver must NOT swallow it — build_environment_hints owns the
-        # try/except OSError guard at the call site (prompt_builder.py:805).
+    def test_deleted_cwd_falls_back_to_kanban_workspace(self, monkeypatch, tmp_path, capsys):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
-        monkeypatch.setattr(rt.os, "getcwd", _raise_oserror)
-        with pytest.raises(OSError):
-            resolve_agent_cwd()
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        monkeypatch.setattr(rt.os, "getcwd", lambda: (_ for _ in ()).throw(FileNotFoundError()))
+        monkeypatch.setattr(rt, "_WARNED_DELETED_CWD", False)
+
+        assert resolve_agent_cwd() == workspace
+        assert "current working directory no longer exists" in capsys.readouterr().err
+
+    def test_deleted_cwd_falls_back_to_home_without_kanban_workspace(self, monkeypatch, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        monkeypatch.delenv("TERMINAL_CWD", raising=False)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path / "gone"))
+        monkeypatch.setattr(Path, "home", lambda: home)
+        monkeypatch.setattr(rt.os, "getcwd", lambda: (_ for _ in ()).throw(FileNotFoundError()))
+        monkeypatch.setattr(rt, "_WARNED_DELETED_CWD", False)
+
+        assert resolve_agent_cwd() == home
 
 
 class TestResolveContextCwd:

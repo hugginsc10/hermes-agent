@@ -11,6 +11,7 @@ contextvar; CLI/cron fall through to `TERMINAL_CWD`/launch cwd.
 """
 
 import os
+import sys
 from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from typing import Any
 _UNSET: Any = object()
 
 _SESSION_CWD: ContextVar = ContextVar("HERMES_SESSION_CWD", default=_UNSET)
+_WARNED_DELETED_CWD = False
 
 
 def set_session_cwd(cwd: str | None) -> Token:
@@ -36,6 +38,32 @@ def _session_cwd_override() -> str:
     return str(value).strip()
 
 
+def safe_getcwd() -> str:
+    """Return the process cwd, tolerating a deleted launch directory.
+
+    ``os.getcwd()`` raises ``FileNotFoundError`` when the process was launched
+    from a directory that has since been removed. Kanban workers have an
+    authoritative fallback in ``HERMES_KANBAN_WORKSPACE``; otherwise use
+    ``$HOME`` so CLI/config startup can continue far enough to report useful
+    errors instead of crashing during import-time cwd resolution.
+    """
+    global _WARNED_DELETED_CWD
+    try:
+        return os.getcwd()
+    except FileNotFoundError:
+        fallback = (os.environ.get("HERMES_KANBAN_WORKSPACE") or "").strip()
+        if not fallback or not Path(fallback).expanduser().is_dir():
+            fallback = os.environ.get("HOME") or str(Path.home())
+        if not _WARNED_DELETED_CWD:
+            print(
+                "warning: current working directory no longer exists; "
+                f"falling back to {fallback}",
+                file=sys.stderr,
+            )
+            _WARNED_DELETED_CWD = True
+        return fallback
+
+
 def resolve_agent_cwd() -> Path:
     override = _session_cwd_override()
     if override:
@@ -47,7 +75,7 @@ def resolve_agent_cwd() -> Path:
         p = Path(raw).expanduser()
         if p.is_dir():
             return p
-    return Path(os.getcwd())
+    return Path(safe_getcwd())
 
 
 def resolve_context_cwd() -> Path | None:
