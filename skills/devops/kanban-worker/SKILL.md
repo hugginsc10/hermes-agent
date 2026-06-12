@@ -33,7 +33,7 @@ If `$HERMES_TENANT` is set, the task belongs to a tenant namespace. When reading
 
 ## Good summary + metadata shapes
 
-The `kanban_complete(summary=..., metadata=...)` handoff is how downstream workers read what you did. The low-risk enforcement layer is prompt/tool-schema guidance first; hard API validation can come later after existing workers have adapted.
+The `kanban_complete(summary=..., metadata=...)` handoff is how downstream workers read what you did. The current contract is intentionally narrow but now includes a hard runtime gate: builder-assigned implementation tasks cannot self-complete, and any task resuming from a `review-required:` or `spot-check-required:` handoff must attach at least one verification artifact when it finally completes.
 
 Minimum metadata keys for terminal completions:
 - `outcome`: concise result/state
@@ -63,7 +63,7 @@ kanban_complete(
 
 **Coding task that needs human review (review-required):**
 
-For most code-changing tasks, the work isn't truly *done* until a human reviewer has eyes on it. Block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url) into a comment first, since `kanban_block` only carries the human-readable reason — comments are the durable annotation channel. Reviewer either approves and runs `hermes kanban unblock <id>` (which re-spawns you with the comment thread for any follow-ups) or asks for changes via another comment.
+For most code-changing tasks, the work isn't truly *done* until a human reviewer has eyes on it. Builder-style workers must block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url, artifact paths) into a comment first, since `kanban_block` only carries the human-readable reason — comments are the durable annotation channel. Reviewer either approves and runs `hermes kanban unblock <id>` (which re-spawns you with the comment thread for any follow-ups) or asks for changes via another comment. If automation cannot prove the result, explain why in the comment and use `spot-check-required:` instead.
 
 ```python
 import json
@@ -74,6 +74,7 @@ kanban_comment(
         "files_changed": ["rate_limiter.py", "tests/test_rate_limiter.py"],
         "tests_run": ["pytest tests/test_rate_limiter.py -q (14 passed)"],
         "evidence": ["14/14 targeted tests pass", "diff_path: /path/to/worktree"],
+        "artifacts": ["/path/to/review-handoff.md", "/path/to/worktree.patch"],
         "risks": ["user_id/IP fallback choice may affect anonymous endpoints"],
         "follow_ups": [],
         "diff_path": "/path/to/worktree",  # or PR url if pushed
@@ -104,15 +105,16 @@ kanban_complete(
 )
 ```
 
-**Review task:**
+**Review / verification task:**
 ```python
 kanban_complete(
     summary="reviewed PR #123; 2 blocking issues found (SQL injection in /search, missing CSRF on /settings)",
+    artifacts=["/tmp/reviewer-verdict.md"],
     metadata={
         "outcome": "review failed with 2 blocking issues",
         "files_changed": [],
         "tests_run": [],
-        "evidence": ["manual diff review of api/search.py and api/settings.py"],
+        "evidence": ["manual diff review of api/search.py and api/settings.py", "artifact: /tmp/reviewer-verdict.md"],
         "risks": ["SQL injection in /search", "missing CSRF on /settings"],
         "follow_ups": ["create remediation cards for both findings"],
         "pr_number": 123,
