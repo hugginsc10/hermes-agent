@@ -31,6 +31,19 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Check out the PR HEAD commit, NOT the auto-generated
+          # refs/pull/N/merge. GitHub regenerates the merge ref asynchronously
+          # whenever the base advances, so the 6 parallel slice jobs can each
+          # land on a stale/inconsistent merge missing a just-pushed test file.
+          # The deterministic LPT slicer then keeps assigning that file to the
+          # same slice, which fails with pytest exit 4 ("file or directory not
+          # found") on every rerun while the file is in the commit and passes
+          # locally (see _run_one_file's exit-4 forensics). Pinning to the head
+          # sha gives every slice the same stable tree containing all PR files.
+          # On push events github.event.pull_request is absent, so this falls
+          # back to github.sha (the pushed commit).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Restore duration cache
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
