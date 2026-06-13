@@ -4073,6 +4073,98 @@ class APIServerAdapter(BasePlatformAdapter):
             "resolved": resolved,
         })
 
+    async def _handle_list_approvals(self, request: "web.Request") -> "web.Response":
+        """GET /v1/approvals — list pending gateway approvals across all sessions.
+
+        Read-only snapshot for the remote Decision Console / web-push watcher.
+        Auth is the standard Bearer check; uuid4 ids make the resolve route
+        non-enumerable, and the stricter password gate lives on the hermes-ui
+        proxy in front of the resolve route.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.approval import list_gateway_approvals
+
+            approvals = list_gateway_approvals()
+        except Exception as exc:
+            logger.exception("[api_server] list approvals failed")
+            return web.json_response(_openai_error(str(exc)), status=500)
+        return web.json_response({"object": "list", "data": approvals})
+
+    async def _handle_resolve_approval_by_id(self, request: "web.Request") -> "web.Response":
+        """POST /v1/approvals/{id}/{choice} — resolve a specific pending approval by id.
+
+        ``choice`` ∈ {once, session, always, deny} plus the deployed-client
+        aliases {approve, approved, allow} → once.  ``always`` is downgraded to
+        ``session`` server-side when the approval was tirith-flagged.  A
+        resolve that finds nothing (already resolved, expired, or never
+        existed) returns 409 ``already_resolved`` — uuid4 ids mean a 409 is
+        never an enumeration leak.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        approval_id = request.match_info.get("id", "")
+        # Approval ids are uuid4 hex (32 lowercase hex chars). Reject anything
+        # else up-front: kills log-injection / oversized-body vectors from an
+        # authenticated caller and makes a malformed id a clean 400 rather than
+        # a wasted queue scan.
+        if not re.fullmatch(r"[0-9a-f]{32}", approval_id):
+            return web.json_response(
+                _openai_error("Invalid approval id", code="invalid_approval_id"),
+                status=400,
+            )
+        raw_choice = str(request.match_info.get("choice", "")).strip().lower()
+        aliases = {"approve": "once", "approved": "once", "allow": "once"}
+        choice = aliases.get(raw_choice, raw_choice)
+        allowed = {"once", "session", "always", "deny"}
+        if choice not in allowed:
+            return web.json_response(
+                _openai_error(
+                    "Invalid approval choice; expected one of: once, session, always, deny",
+                    code="invalid_approval_choice",
+                ),
+                status=400,
+            )
+
+        try:
+            from tools.approval import resolve_gateway_approval_by_id
+
+            outcome = resolve_gateway_approval_by_id(approval_id, choice)
+        except Exception as exc:
+            logger.exception("[api_server] approval resolution failed for id %s", approval_id)
+            return web.json_response(_openai_error(str(exc)), status=500)
+
+        if not outcome.get("resolved"):
+            return web.json_response(
+                _openai_error(
+                    f"Approval not pending (already resolved or expired): {approval_id}",
+                    code="already_resolved",
+                ),
+                status=409,
+            )
+
+        effective = outcome.get("choice", choice)
+        # Audit trail: id + requested choice + effective (post-downgrade) +
+        # session + request origin.
+        logger.info(
+            "[api_server] approval resolved id=%s choice=%s effective=%s session=%s %s",
+            approval_id,
+            raw_choice or choice,
+            effective,
+            outcome.get("session_key", ""),
+            self._request_audit_log_suffix(request),
+        )
+        return web.json_response({
+            "object": "hermes.approval_response",
+            "approval_id": approval_id,
+            "choice": effective,
+            "resolved": True,
+        })
+
     async def _handle_stop_run(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
         auth_err = self._check_auth(request)
@@ -4197,6 +4289,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/approval", self._handle_run_approval)
+            self._app.router.add_get("/v1/approvals", self._handle_list_approvals)
+            self._app.router.add_post("/v1/approvals/{id}/{choice}", self._handle_resolve_approval_by_id)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering

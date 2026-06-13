@@ -15,6 +15,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 import unicodedata
 from typing import Optional
 from hermes_cli.config import cfg_get
@@ -626,12 +627,17 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result")
+    __slots__ = ("event", "data", "result", "approval_id", "session_key",
+                 "requested_at", "expires_at")
 
     def __init__(self, data: dict):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+        self.approval_id: str = ""         # uuid4 hex, stamped at enqueue
+        self.session_key: str = ""         # owning session, stamped at enqueue
+        self.requested_at: float = 0.0     # wall-clock enqueue time (epoch secs)
+        self.expires_at: float = 0.0       # wall-clock deadline = requested_at + timeout
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
@@ -690,6 +696,92 @@ def resolve_gateway_approval(session_key: str, choice: str,
         entry.result = choice
         entry.event.set()
     return len(targets)
+
+
+def resolve_gateway_approval_by_id(approval_id: str, choice: str) -> dict:
+    """Resolve one specific pending gateway approval by its uuid id.
+
+    Unlike :func:`resolve_gateway_approval` (which pops the oldest entry in a
+    single session, FIFO), this targets one entry anywhere in any session
+    queue — the surface the REST / web Decision Console needs, where the
+    operator acts on a *named* card rather than "the next one".
+
+    Locate-and-remove happens inside one ``_lock`` critical section, so only
+    the caller that actually removes the entry goes on to set its result and
+    wake the blocked agent thread.  A racing second resolve (e.g. a Telegram
+    button tapped just after a web approve) finds nothing and returns
+    ``{"resolved": False, "reason": "not_found"}`` — handlers map that to a
+    409 ``already_resolved``.
+
+    ``always`` is downgraded to ``session`` when the entry was flagged
+    ``allow_permanent=False`` (a tirith warning), mirroring the CLI guard at
+    :func:`_prompt_user_approval` so no surface can plant a permanent
+    allowlist entry the CLI itself would refuse.
+
+    Returns ``{"resolved": True, "session_key": str, "choice": str}`` on
+    success (``choice`` reflects any downgrade), else
+    ``{"resolved": False, "reason": "not_found"}``.
+    """
+    if not approval_id:
+        return {"resolved": False, "reason": "not_found"}
+
+    target = None
+    target_session = None
+    with _lock:
+        for sk, queue in _gateway_queues.items():
+            for e in queue:
+                if e.approval_id == approval_id:
+                    target, target_session = e, sk
+                    break
+            if target is not None:
+                break
+        if target is None:
+            return {"resolved": False, "reason": "not_found"}
+        queue = _gateway_queues.get(target_session)
+        if queue and target in queue:
+            queue.remove(target)
+        if not queue:
+            _gateway_queues.pop(target_session, None)
+
+    # Mirror the CLI's permanence gate: a tirith-flagged command (which the
+    # caller marks allow_permanent=False) can never be granted permanently,
+    # regardless of which surface sent "always". The default is True so an
+    # approval that omits the field entirely (e.g. execute_code, which has no
+    # tirith concept and legitimately persists "always") is NOT downgraded.
+    if choice == "always" and not (target.data or {}).get("allow_permanent", True):
+        choice = "session"
+
+    target.result = choice
+    target.event.set()
+    return {"resolved": True, "session_key": target_session, "choice": choice}
+
+
+def list_gateway_approvals() -> list[dict]:
+    """Snapshot every pending gateway approval across all sessions.
+
+    Scans the per-session queues under ``_lock`` (they are tiny — at most a
+    handful of entries each) and returns plain, JSON-serializable dicts; no
+    ``_ApprovalEntry`` object escapes the lock.  Ordered oldest-first so the
+    Decision Console renders a stable, FIFO-aligned list.
+    """
+    out: list[dict] = []
+    with _lock:
+        for sk, queue in _gateway_queues.items():
+            for e in queue:
+                data = e.data or {}
+                out.append({
+                    "approval_id": e.approval_id,
+                    "session_key": sk,
+                    "command": data.get("command", ""),
+                    "description": data.get("description", ""),
+                    "pattern_keys": list(data.get("pattern_keys", []) or []),
+                    "allow_permanent": bool(data.get("allow_permanent", False)),
+                    "agent_label": data.get("agent_label") or data.get("agent") or "",
+                    "requested_at": e.requested_at,
+                    "expires_at": e.expires_at,
+                })
+    out.sort(key=lambda a: a.get("requested_at") or 0.0)
+    return out
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -1189,7 +1281,29 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
+    # Resolve the gateway approval timeout up-front (config is hot-read via an
+    # mtime-cached load) so we can stamp a wall-clock expiry the remote
+    # Decision Console / web-push surfaces can count down against. The
+    # monotonic deadline for the wait loop below is derived from the same
+    # value, so a single read governs both.
+    timeout = _get_approval_config().get("gateway_timeout", 300)
+    try:
+        timeout = int(timeout)
+    except (ValueError, TypeError):
+        timeout = 300
+
     entry = _ApprovalEntry(approval_data)
+    entry.approval_id = uuid.uuid4().hex
+    entry.session_key = session_key
+    _enqueue_monotonic = time.monotonic()
+    entry.requested_at = time.time()
+    entry.expires_at = entry.requested_at + max(timeout, 0)
+    # Surface the id + timestamps on the payload so every notify channel
+    # (api-server SSE, Telegram, the hermes-ui web-push watcher) can reference
+    # this specific approval and time-box it.
+    approval_data["approval_id"] = entry.approval_id
+    approval_data["requested_at"] = entry.requested_at
+    approval_data["expires_at"] = entry.expires_at
     with _lock:
         _gateway_queues.setdefault(session_key, []).append(entry)
 
@@ -1221,23 +1335,22 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         _drop_entry()
         return {"resolved": False, "choice": None, "notify_failed": True}
 
-    # Block until the user responds or timeout (default 5 min). Poll in short
+    # Block until the user responds or the timeout elapses. Poll in short
     # slices so we can fire activity heartbeats every ~10s to the agent's
     # inactivity tracker — otherwise the gateway watchdog kills the agent
     # while the user is still responding. Mirrors _wait_for_process() cadence.
-    timeout = _get_approval_config().get("gateway_timeout", 300)
-    try:
-        timeout = int(timeout)
-    except (ValueError, TypeError):
-        timeout = 300
-
+    # (``timeout`` / ``expires_at`` were resolved at enqueue, above.)
     try:
         from tools.environments.base import touch_activity_if_due
     except Exception:  # pragma: no cover
         touch_activity_if_due = None
 
+    # Anchor the wait deadline to the same instant the entry's wall-clock
+    # expires_at was stamped (above), so the Decision Console countdown and the
+    # real server-side timeout agree — notify/hook latency counts against both
+    # equally instead of skewing the advertised expiry.
     _now = time.monotonic()
-    _deadline = _now + max(timeout, 0)
+    _deadline = _enqueue_monotonic + max(timeout, 0)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
     while True:
