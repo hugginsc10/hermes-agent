@@ -324,10 +324,21 @@ class _FakeHindsight:
         self.closed = True
 
 
-def test_default_fetcher_parses_directive_content(monkeypatch):
-    import hindsight_client
+def _install_fake_hindsight(monkeypatch, hindsight_cls):
+    """Inject a fake ``hindsight_client`` module so the lazy
+    ``from hindsight_client import Hindsight`` inside ``_default_fetcher``
+    resolves to our stub — without requiring the real optional dependency
+    (it is not installed in CI)."""
+    import sys
+    import types
 
-    monkeypatch.setattr(hindsight_client, "Hindsight", _FakeHindsight)
+    mod = types.ModuleType("hindsight_client")
+    mod.Hindsight = hindsight_cls
+    monkeypatch.setitem(sys.modules, "hindsight_client", mod)
+
+
+def test_default_fetcher_parses_directive_content(monkeypatch):
+    _install_fake_hindsight(monkeypatch, _FakeHindsight)
     raw = jt._default_fetcher()
     assert isinstance(raw, list) and len(raw) == 1
     assert raw[0]["board"] == BOARD
@@ -340,22 +351,18 @@ def test_default_fetcher_parses_directive_content(monkeypatch):
 
 
 def test_default_fetcher_close_failure_is_swallowed(monkeypatch):
-    import hindsight_client
-
     class _ExplodingClose(_FakeHindsight):
         def close(self):
             raise RuntimeError("close blew up")
 
-    monkeypatch.setattr(hindsight_client, "Hindsight", _ExplodingClose)
+    _install_fake_hindsight(monkeypatch, _ExplodingClose)
     # _safe_close swallows the error; fetch still returns the parsed template.
     raw = jt._default_fetcher()
     assert len(raw) == 1
 
 
 def test_load_job_template_end_to_end_through_default_fetcher(monkeypatch):
-    import hindsight_client
-
-    monkeypatch.setattr(hindsight_client, "Hindsight", _FakeHindsight)
+    _install_fake_hindsight(monkeypatch, _FakeHindsight)
     tmpl = jt.load_job_template(BOARD, assignee="builder", use_cache=False)
     assert tmpl is not None and tmpl.require_refuter is True
 
@@ -369,8 +376,6 @@ def test_has_template_tags_is_strict():
 
 
 def test_default_fetcher_skips_untagged_json_directive(monkeypatch):
-    import hindsight_client
-
     class _MixedHindsight(_FakeHindsight):
         def __init__(self, **kwargs):
             super().__init__(**kwargs)
@@ -383,7 +388,7 @@ def test_default_fetcher_skips_untagged_json_directive(monkeypatch):
                 ]
             )
 
-    monkeypatch.setattr(hindsight_client, "Hindsight", _MixedHindsight)
+    _install_fake_hindsight(monkeypatch, _MixedHindsight)
     raw = jt._default_fetcher()
     assert len(raw) == 1
     assert raw[0]["selector"]["kind"] == "board-default"
