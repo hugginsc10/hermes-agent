@@ -78,9 +78,14 @@ def test_kanban_handoff_quality_templates_in_tool_schemas():
     ]
     for token in handoff_tokens:
         assert token in complete_schema
+    assert "review-required:" in complete_schema
+    assert "spot-check-required:" in complete_schema
+    assert "artifact" in complete_schema
     assert "exact blocker" in block_schema
     assert "steps" in block_schema
     assert "input needed" in block_schema
+    assert "review-required:" in block_schema
+    assert "spot-check-required:" in block_schema
 
 
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
@@ -516,6 +521,107 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({"summary": "x", "metadata": [1, 2, 3]})
     assert json.loads(out).get("error")
+
+
+def test_builder_assigned_task_cannot_self_complete(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="builder task", assignee="builder")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({"summary": "implemented the feature"})
+    err = json.loads(out).get("error", "")
+    assert "builder-assigned work cannot self-complete" in err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_review_required_completion_rejects_missing_artifacts(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewer task", assignee="reviewer")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        kb.block_task(
+            conn,
+            tid,
+            reason="review-required: verify the diff",
+            expected_run_id=run.id,
+        )
+        assert kb.unblock_task(conn, tid) is True
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({"summary": "review passed but I forgot the artifact"})
+    err = json.loads(out).get("error", "")
+    assert "must attach at least one verification artifact" in err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_review_required_completion_accepts_artifacts(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewer task", assignee="reviewer")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        kb.block_task(
+            conn,
+            tid,
+            reason="review-required: verify the diff",
+            expected_run_id=run.id,
+        )
+        assert kb.unblock_task(conn, tid) is True
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({
+        "summary": "review passed with artifact-backed verification",
+        "artifacts": ["/tmp/reviewer-verdict.md"],
+    })
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert run is not None
+        metadata = run.metadata or {}
+        assert metadata.get("artifacts") == ["/tmp/reviewer-verdict.md"]
+    finally:
+        conn.close()
 
 
 def test_complete_phantom_card_message_advertises_retry(worker_env):
