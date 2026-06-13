@@ -2,6 +2,7 @@
 
 import json
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -357,6 +358,32 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["state"] == "connected"
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
+
+    def test_concurrent_writers_do_not_lose_a_field(self, tmp_path, monkeypatch):
+        """Regression: concurrent write_runtime_status calls each updating a
+        distinct platform must all survive. Without serializing the
+        read-modify-write, racing callers read the same snapshot and the last
+        writer clobbers the others' platforms.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        platforms = [f"p{i}" for i in range(12)]
+        barrier = threading.Barrier(len(platforms))
+
+        def worker(name: str) -> None:
+            barrier.wait()  # maximize overlap on the read-modify-write
+            status.write_runtime_status(platform=name, platform_state="connected")
+
+        threads = [threading.Thread(target=worker, args=(p,)) for p in platforms]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        payload = status.read_runtime_status()
+        assert set(payload["platforms"]) == set(platforms)
+        assert all(payload["platforms"][p]["state"] == "connected" for p in platforms)
+        assert (tmp_path / "gateway_state.lock").exists()
 
 
 class TestTerminatePid:
