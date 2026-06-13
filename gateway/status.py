@@ -464,7 +464,7 @@ def _runtime_status_lock():
         try:
             lock_path = _get_runtime_status_lock_path()
             lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = open(lock_path, "a+")
+            handle = open(lock_path, "a+", encoding="utf-8")
             deadline = time.monotonic() + _RUNTIME_STATUS_LOCK_TIMEOUT
             while True:
                 if _try_acquire_file_lock(handle):
