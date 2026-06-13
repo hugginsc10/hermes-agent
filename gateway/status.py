@@ -17,6 +17,9 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -427,6 +430,57 @@ def _release_file_lock(handle) -> None:
         pass
 
 
+_RUNTIME_STATUS_LOCK_FILENAME = "gateway_state.lock"
+_runtime_status_thread_lock = threading.Lock()
+_RUNTIME_STATUS_LOCK_TIMEOUT = 2.0
+_RUNTIME_STATUS_LOCK_POLL = 0.05
+
+
+def _get_runtime_status_lock_path() -> Path:
+    """Lock file guarding the gateway_state.json read-modify-write."""
+    return _get_pid_path().with_name(_RUNTIME_STATUS_LOCK_FILENAME)
+
+
+@contextmanager
+def _runtime_status_lock():
+    """Serialize the gateway_state read-modify-write across threads and processes.
+
+    ``gateway_state.json`` is updated read → mutate → write by the gateway, the
+    dispatcher and assorted watchers. The file *write* is already atomic
+    (``atomic_json_write``), but without serialization two concurrent callers can
+    each read the same snapshot, set different fields, and have the second write
+    clobber the first's field — a torn *logical* update.
+
+    In-process callers are serialized by a ``threading.Lock``; cross-process
+    callers by a best-effort advisory file lock with a bounded wait. If the file
+    lock can't be acquired within the timeout we proceed anyway: the atomic write
+    still prevents a torn *file*, so the worst case degrades to today's
+    last-writer-wins behavior rather than blocking the gateway indefinitely. The
+    flock is released automatically if a holder dies.
+    """
+    with _runtime_status_thread_lock:
+        handle = None
+        acquired = False
+        try:
+            lock_path = _get_runtime_status_lock_path()
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(lock_path, "a+")
+            deadline = time.monotonic() + _RUNTIME_STATUS_LOCK_TIMEOUT
+            while True:
+                if _try_acquire_file_lock(handle):
+                    acquired = True
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(_RUNTIME_STATUS_LOCK_POLL)
+            yield acquired
+        finally:
+            if handle is not None:
+                if acquired:
+                    _release_file_lock(handle)
+                handle.close()
+
+
 def acquire_gateway_runtime_lock() -> bool:
     """Claim the cross-process runtime lock for the gateway.
 
@@ -521,38 +575,44 @@ def write_runtime_status(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
 ) -> None:
-    """Persist gateway runtime health information for diagnostics/status."""
+    """Persist gateway runtime health information for diagnostics/status.
+
+    The read-modify-write below is serialized under ``_runtime_status_lock`` so
+    concurrent writers (gateway / dispatcher / watchers) can't clobber each
+    other's fields with a stale snapshot.
+    """
     path = _get_runtime_status_path()
-    payload = _read_json_file(path) or _build_runtime_status_record()
-    current_record = _build_pid_record()
-    payload.setdefault("platforms", {})
-    payload["kind"] = current_record["kind"]
-    payload["pid"] = current_record["pid"]
-    payload["argv"] = current_record["argv"]
-    payload["start_time"] = current_record["start_time"]
-    payload["updated_at"] = _utc_now_iso()
+    with _runtime_status_lock():
+        payload = _read_json_file(path) or _build_runtime_status_record()
+        current_record = _build_pid_record()
+        payload.setdefault("platforms", {})
+        payload["kind"] = current_record["kind"]
+        payload["pid"] = current_record["pid"]
+        payload["argv"] = current_record["argv"]
+        payload["start_time"] = current_record["start_time"]
+        payload["updated_at"] = _utc_now_iso()
 
-    if gateway_state is not _UNSET:
-        payload["gateway_state"] = gateway_state
-    if exit_reason is not _UNSET:
-        payload["exit_reason"] = exit_reason
-    if restart_requested is not _UNSET:
-        payload["restart_requested"] = bool(restart_requested)
-    if active_agents is not _UNSET:
-        payload["active_agents"] = max(0, int(active_agents))
+        if gateway_state is not _UNSET:
+            payload["gateway_state"] = gateway_state
+        if exit_reason is not _UNSET:
+            payload["exit_reason"] = exit_reason
+        if restart_requested is not _UNSET:
+            payload["restart_requested"] = bool(restart_requested)
+        if active_agents is not _UNSET:
+            payload["active_agents"] = max(0, int(active_agents))
 
-    if platform is not _UNSET:
-        platform_payload = payload["platforms"].get(platform, {})
-        if platform_state is not _UNSET:
-            platform_payload["state"] = platform_state
-        if error_code is not _UNSET:
-            platform_payload["error_code"] = error_code
-        if error_message is not _UNSET:
-            platform_payload["error_message"] = error_message
-        platform_payload["updated_at"] = _utc_now_iso()
-        payload["platforms"][platform] = platform_payload
+        if platform is not _UNSET:
+            platform_payload = payload["platforms"].get(platform, {})
+            if platform_state is not _UNSET:
+                platform_payload["state"] = platform_state
+            if error_code is not _UNSET:
+                platform_payload["error_code"] = error_code
+            if error_message is not _UNSET:
+                platform_payload["error_message"] = error_message
+            platform_payload["updated_at"] = _utc_now_iso()
+            payload["platforms"][platform] = platform_payload
 
-    _write_json_file(path, payload)
+        _write_json_file(path, payload)
 
 
 def read_runtime_status() -> Optional[dict[str, Any]]:
