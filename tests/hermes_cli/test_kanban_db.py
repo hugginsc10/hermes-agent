@@ -1559,6 +1559,107 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         assert kb.get_task(conn, t).claim_lock is None
 
 
+def test_dispatch_provider_auth_preflight_blocks_without_spawn(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    monkeypatch.setattr(
+        kb,
+        "_provider_auth_preflight_failure",
+        lambda task: {
+            "detail": "token_expired",
+            "provider": "openai-codex",
+            "error": "token_expired: refresh required",
+        },
+    )
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="bad-token", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+        task = kb.get_task(conn, t)
+        runs = kb.list_runs(conn, t)
+        event_kinds = [event.kind for event in kb.list_events(conn, t)]
+
+    assert task is not None
+    assert spawned_ids == []
+    assert res.provider_auth_required == [t]
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert task.current_run_id is None
+    assert runs[-1].outcome == "provider_auth_required"
+    assert "provider_auth_required" in event_kinds
+    assert "blocked" in event_kinds
+
+    with kb.connect() as conn:
+        res2 = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert res2.provider_auth_required == []
+    assert spawned_ids == []
+
+
+def test_dispatch_provider_auth_preflight_allows_valid_credential(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    monkeypatch.setattr(kb, "_provider_auth_preflight_failure", lambda task: None)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="valid-token", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+
+    assert task is not None
+    assert spawned_ids == [t]
+    assert res.provider_auth_required == []
+    assert task.status == "running"
+
+
+def test_provider_auth_preflight_reports_profile_runtime_auth_error(
+    kanban_home, monkeypatch
+):
+    profile_dir = kanban_home / "profiles" / "alice"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5\n",
+        encoding="utf-8",
+    )
+    original_home = os.environ.get("HERMES_HOME")
+
+    from hermes_cli.auth import AuthError
+    from hermes_cli import runtime_provider
+
+    def raise_auth_error(**kwargs):
+        raise AuthError(
+            "token_expired: HTTP 401 unauthorized",
+            provider="openai-codex",
+            code="token_expired",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(runtime_provider, "resolve_runtime_provider", raise_auth_error)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="bad-runtime", assignee="alice")
+        task = kb.get_task(conn, t)
+
+    failure = kb._provider_auth_preflight_failure(task)
+
+    assert failure is not None
+    assert failure["detail"] == "token_expired"
+    assert failure["provider"] == "openai-codex"
+    assert failure["profile"] == "alice"
+    assert os.environ.get("HERMES_HOME") == original_home
+
+
 def test_dispatch_max_spawn_counts_existing_running_tasks(
     kanban_home, all_assignees_spawnable
 ):

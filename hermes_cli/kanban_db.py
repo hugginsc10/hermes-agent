@@ -1089,7 +1089,15 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Structured crash diagnostics for signature-keyed alerting. ``error``
+    -- stays as the short human-facing status; error_detail carries the
+    -- specific provider/config/cwd/log excerpt when available. Log offsets
+    -- bound the worker-log slice for later archaeology without storing the
+    -- whole log in SQLite.
+    error_detail        TEXT,
+    log_offset_start    INTEGER,
+    log_offset_end      INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -1750,6 +1758,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
     ).fetchone() is not None
     if runs_exist:
+        run_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")}
+        if "error_detail" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "error_detail", "error_detail TEXT")
+        if "log_offset_start" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "log_offset_start", "log_offset_start INTEGER")
+        if "log_offset_end" not in run_cols:
+            _add_column_if_missing(conn, "task_runs", "log_offset_end", "log_offset_end INTEGER")
+
         with write_txn(conn):
             inflight = conn.execute(
                 "SELECT id, assignee, claim_lock, claim_expires, worker_pid, "
@@ -1851,7 +1867,8 @@ _REBUILD_SPECS = {
         " worker_pid INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
-        " error TEXT)",
+        " error TEXT, error_detail TEXT, log_offset_start INTEGER,"
+        " log_offset_end INTEGER)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
@@ -5098,6 +5115,8 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    provider_auth_required: list[str] = field(default_factory=list)
+    """Task ids blocked by provider-auth preflight before spawning a worker."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -5670,6 +5689,161 @@ def _provider_auth_failure_detail(text: str) -> Optional[str]:
     if "oauth" in lowered:
         return "oauth-token-invalid"
     return "provider-auth"
+
+
+@contextlib.contextmanager
+def _temporary_profile_env(profile_name: str):
+    """Temporarily resolve config/env exactly as a spawned profile would."""
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    profile_arg = normalize_profile_name(profile_name)
+    profile_home = resolve_profile_env(profile_arg)
+    original_env = dict(os.environ)
+    try:
+        os.environ["HERMES_HOME"] = profile_home
+        os.environ["HERMES_PROFILE"] = profile_arg
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+
+            project_env = Path(__file__).resolve().parent.parent / ".env"
+            load_hermes_dotenv(hermes_home=profile_home, project_env=project_env)
+        except Exception:
+            _log.debug(
+                "kanban provider-auth preflight: failed to load env for profile %s",
+                profile_arg,
+                exc_info=True,
+            )
+        yield profile_arg, Path(profile_home)
+    finally:
+        os.environ.clear()
+        os.environ.update(original_env)
+        try:
+            from hermes_cli.env_loader import reset_secret_source_cache
+
+            reset_secret_source_cache()
+        except Exception:
+            pass
+
+
+def _provider_auth_preflight_failure(task: Task) -> Optional[dict[str, Any]]:
+    """Return provider-auth failure metadata for ``task`` or ``None``.
+
+    This runs before worker spawn so known-bad credentials block once instead
+    of producing a crash/retry storm.  The post-exit classifier remains as a
+    backstop for auth failures only visible during the first model call.
+    """
+    if not task.assignee:
+        return None
+    try:
+        with _temporary_profile_env(task.assignee) as (profile_arg, profile_home):
+            if not any(
+                (profile_home / name).exists()
+                for name in ("config.yaml", ".env", "auth.json")
+            ):
+                # Synthetic test profiles and bare placeholder lanes have no
+                # provider state to preflight.  Preserve legacy spawn behavior
+                # rather than treating an unconfigured fixture as bad auth.
+                return None
+            from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+            from hermes_cli.runtime_provider import (
+                format_runtime_provider_error,
+                resolve_runtime_provider,
+            )
+
+            try:
+                resolve_runtime_provider(target_model=task.model_override)
+            except AuthError as exc:
+                if is_rate_limited_auth_error(exc):
+                    return None
+                message = format_runtime_provider_error(exc)
+                detail = (
+                    _provider_auth_failure_detail(message)
+                    or str(getattr(exc, "code", "") or "").replace("_", "-")
+                    or "provider-auth"
+                )
+                return {
+                    "detail": detail,
+                    "provider": getattr(exc, "provider", "") or "unknown",
+                    "profile": profile_arg,
+                    "error": message,
+                }
+            except Exception as exc:
+                message = format_runtime_provider_error(exc)
+                detail = _provider_auth_failure_detail(message)
+                if detail:
+                    return {
+                        "detail": detail,
+                        "provider": "unknown",
+                        "profile": profile_arg,
+                        "error": message,
+                    }
+                _log.debug(
+                    "kanban provider-auth preflight: non-auth provider resolution failure for %s",
+                    task.id,
+                    exc_info=True,
+                )
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _block_provider_auth_required(
+    conn: sqlite3.Connection,
+    task: Task,
+    failure: dict[str, Any],
+) -> bool:
+    """Block a claimed task because provider preflight found bad auth."""
+    from agent.redact import redact_sensitive_text
+
+    detail = str(failure.get("detail") or "provider-auth")
+    provider = str(failure.get("provider") or "unknown")
+    profile = str(failure.get("profile") or task.assignee or "unknown")
+    raw_error = str(failure.get("error") or detail)
+    safe_error = redact_sensitive_text(raw_error, force=True)
+    error_text = (
+        "auth-required/provider-auth: preflight failed "
+        f"with {detail}; refresh credentials for profile {profile}"
+    )
+    reason = f"provider-auth-required: {detail} — refresh credentials for profile {profile}"
+    payload = {
+        "source": "dispatch_preflight",
+        "provider_auth_detail": detail,
+        "provider": provider,
+        "profile": profile,
+        "error": safe_error,
+    }
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, last_failure_error = ? "
+            "WHERE id = ? AND status = 'running'",
+            (error_text[:500], task.id),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn,
+            task.id,
+            outcome="provider_auth_required",
+            status="blocked",
+            error=error_text,
+            metadata=payload,
+        )
+        _append_event(
+            conn,
+            task.id,
+            "provider_auth_required",
+            payload,
+            run_id=run_id,
+        )
+        _append_event(
+            conn,
+            task.id,
+            "blocked",
+            {"reason": reason, "source": "dispatch_preflight"},
+            run_id=run_id,
+        )
+    return True
 
 
 def _worker_log_excerpt_for_task(task_id: str, *, max_bytes: int = 4096) -> dict[str, Any]:
@@ -6619,6 +6793,11 @@ def dispatch_once(
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
+        provider_auth_failure = _provider_auth_preflight_failure(claimed)
+        if provider_auth_failure:
+            if _block_provider_auth_required(conn, claimed, provider_auth_failure):
+                result.provider_auth_required.append(claimed.id)
+            continue
         try:
             workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
@@ -6716,6 +6895,11 @@ def dispatch_once(
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            continue
+        provider_auth_failure = _provider_auth_preflight_failure(claimed)
+        if provider_auth_failure:
+            if _block_provider_auth_required(conn, claimed, provider_auth_failure):
+                result.provider_auth_required.append(claimed.id)
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
