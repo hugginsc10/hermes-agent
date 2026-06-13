@@ -2752,6 +2752,18 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    final_metadata = metadata
+    if metadata:
+        existing_row = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,),
+        ).fetchone()
+        if existing_row and existing_row["metadata"]:
+            try:
+                parsed = json.loads(existing_row["metadata"])
+                if isinstance(parsed, dict):
+                    final_metadata = {**parsed, **metadata}
+            except Exception:
+                final_metadata = metadata
     conn.execute(
         """
         UPDATE task_runs
@@ -2772,7 +2784,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(final_metadata, ensure_ascii=False) if final_metadata else None,
             now,
             run_id,
         ),
@@ -2788,6 +2800,31 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+def _merge_current_run_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    updates: dict[str, Any],
+) -> None:
+    """Merge compact evidence into the currently-active run metadata."""
+    run_id = _current_run_id(conn, task_id)
+    if run_id is None:
+        return
+    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
+    existing: dict[str, Any] = {}
+    if row and row["metadata"]:
+        try:
+            parsed = json.loads(row["metadata"])
+            if isinstance(parsed, dict):
+                existing = parsed
+        except Exception:
+            existing = {}
+    existing.update({k: v for k, v in updates.items() if v is not None})
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ? AND ended_at IS NULL",
+        (json.dumps(existing, ensure_ascii=False), run_id),
+    )
 
 
 def _synthesize_ended_run(
@@ -5591,6 +5628,75 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+# Provider-auth failure signatures. Every arm requires explicit failure
+# context: a bare ``401`` (user ids, line numbers), a bare ``unauthorized``
+# (firewall logs, task descriptions about auth features) or a generic
+# ``invalid token`` (parser/lexer/CSRF errors) must NOT classify a crash
+# as an auth failure — a false positive here suppresses the real crash
+# record and the circuit-breaker accounting for the task.
+_PROVIDER_AUTH_RE = re.compile(
+    r"(?is)(?:"
+    r"\b401\b[^\n]{0,60}\bunauthorized\b|"
+    r"\bunauthorized\b[^\n]{0,40}\b401\b|"
+    r"\bhttp[^\n]{0,12}\b401\b|"
+    r"\bstatus(?:[ _]code)?\W{0,4}401\b|"
+    r"\berror\W{0,4}401\b|"
+    r"\btoken[_ ]expired\b|"
+    r"\brejected[-_ ]?token\b|"
+    r"\bexpired[_ ](?:access[_ ]|refresh[_ ])?token\b|"
+    r"\binvalid[_ ]?api[_ ]?key\b|"
+    r"\binvalid x-api-key\b|"
+    r"\bauthentication[_ ]?error\b|"
+    r"\boauth(?:2)?\b[^\n]{0,60}\btoken\b[^\n]{0,60}"
+    r"\b(?:invalid|expired|rejected|revoked|not validated|could not be validated)"
+    r")"
+)
+
+
+def _provider_auth_failure_detail(text: str) -> Optional[str]:
+    if not text or not _PROVIDER_AUTH_RE.search(text):
+        return None
+    lowered = text.lower()
+    if "token_expired" in lowered or "token expired" in lowered:
+        return "token_expired"
+    if "rejected-token" in lowered or "rejected_token" in lowered or "rejected token" in lowered:
+        return "rejected-token"
+    if "invalid_api_key" in lowered or "invalid api key" in lowered or "invalid x-api-key" in lowered:
+        return "invalid-api-key"
+    if "authenticationerror" in lowered or "authentication_error" in lowered or "authentication error" in lowered:
+        return "authentication-error"
+    if "401" in lowered or "unauthorized" in lowered:
+        return "http-401"
+    if "oauth" in lowered:
+        return "oauth-token-invalid"
+    return "provider-auth"
+
+
+def _worker_log_excerpt_for_task(task_id: str, *, max_bytes: int = 4096) -> dict[str, Any]:
+    """Return compact worker-log evidence for crash classification."""
+    path = worker_logs_dir() / f"{task_id}.log"
+    payload: dict[str, Any] = {"log_path": str(path)}
+    try:
+        size = path.stat().st_size
+        payload["log_size"] = int(size)
+        start = max(0, size - max_bytes)
+        with path.open("rb") as handle:
+            handle.seek(start)
+            data = handle.read(max_bytes)
+        payload["log_excerpt_offset"] = start
+        payload["log_excerpt"] = data.decode("utf-8", errors="replace").strip()[-max_bytes:]
+    except OSError as exc:
+        payload["log_error"] = str(exc)
+    return payload
+
+
+def _compact_log_excerpt(evidence: dict[str, Any], *, limit: int = 1200) -> str:
+    text = str(evidence.get("log_excerpt") or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -5691,6 +5797,78 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 }
             else:
                 protocol_violation = False
+                from agent.redact import redact_sensitive_text
+
+                log_evidence = _worker_log_excerpt_for_task(row["id"])
+                # Classify against the full tail read (4096B); the compact
+                # form is only the durable-storage shape. Redact before
+                # persisting — auth-failure tails are exactly where raw
+                # Authorization headers / OAuth error bodies appear, and
+                # run rows are durable. force=True: hard safety boundary,
+                # not subject to the logging redaction preference.
+                provider_auth_detail = _provider_auth_failure_detail(
+                    str(log_evidence.get("log_excerpt") or "")
+                )
+                log_excerpt = redact_sensitive_text(
+                    _compact_log_excerpt(log_evidence), force=True
+                )
+                if kind == "nonzero_exit" and provider_auth_detail:
+                    error_text = (
+                        "auth-required/provider-auth: worker exited during startup/model call "
+                        f"with {provider_auth_detail}; refresh credentials for profile "
+                        f"{row['claim_lock'] or 'unknown'}"
+                    )
+                    event_kind = "provider_auth_required"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_kind": kind,
+                        "exit_code": code,
+                        "provider_auth_detail": provider_auth_detail,
+                        "error": error_text,
+                        **{k: v for k, v in log_evidence.items() if k != "log_excerpt"},
+                        "log_excerpt": log_excerpt,
+                    }
+                    cur = conn.execute(
+                        "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL, "
+                        "last_failure_error = ? "
+                        "WHERE id = ? AND status = 'running'",
+                        (error_text[:500], row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        run_id = _end_run(
+                            conn, row["id"],
+                            outcome="provider_auth_required",
+                            status="blocked",
+                            error=error_text,
+                            metadata=event_payload,
+                        )
+                        _append_event(
+                            conn, row["id"], event_kind,
+                            event_payload,
+                            run_id=run_id,
+                        )
+                        # Sticky block: without a ``blocked`` event row,
+                        # ``_has_sticky_block`` returns False and
+                        # ``recompute_ready`` auto-promotes the task back
+                        # to ready on the very next tick — an invisible
+                        # respawn loop against dead credentials. The
+                        # operator must refresh credentials and unblock.
+                        _append_event(
+                            conn, row["id"], "blocked",
+                            {
+                                "reason": (
+                                    f"provider-auth-required: {provider_auth_detail} — "
+                                    "refresh credentials for profile "
+                                    f"{row['claim_lock'] or 'unknown'}"
+                                ),
+                                "source": "detect_crashed_workers",
+                            },
+                            run_id=run_id,
+                        )
+                        crashed.append(row["id"])
+                    continue
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
@@ -5702,6 +5880,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+                if log_excerpt:
+                    event_payload.update({
+                        **{k: v for k, v in log_evidence.items() if k != "log_excerpt"},
+                        "log_excerpt": log_excerpt,
+                    })
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6449,6 +6632,18 @@ def dispatch_once(
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        log_path = worker_logs_dir(board=board) / f"{claimed.id}.log"
+        try:
+            log_start_offset = log_path.stat().st_size
+        except OSError:
+            log_start_offset = 0
+        with write_txn(conn):
+            _merge_current_run_metadata(conn, claimed.id, {
+                "attempted_spawn_cwd": str(workspace),
+                "attempted_spawn_log_path": str(log_path),
+                "attempted_spawn_log_start_offset": log_start_offset,
+                "assignee": claimed.assignee,
+            })
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             # Back-compat: older spawn_fn signatures accept only
@@ -6535,6 +6730,19 @@ def dispatch_once(
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
+        log_path = worker_logs_dir(board=board) / f"{claimed.id}.log"
+        try:
+            log_start_offset = log_path.stat().st_size
+        except OSError:
+            log_start_offset = 0
+        with write_txn(conn):
+            _merge_current_run_metadata(conn, claimed.id, {
+                "attempted_spawn_cwd": str(workspace),
+                "attempted_spawn_log_path": str(log_path),
+                "attempted_spawn_log_start_offset": log_start_offset,
+                "assignee": claimed.assignee,
+                "source_status": "review",
+            })
         # Force-load sdlc-review skill for review agents.  The
         # _default_spawn function already auto-loads kanban-worker, and
         # appends task.skills via --skills.  Setting task.skills here
@@ -6975,6 +7183,21 @@ def _default_spawn(
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
+    try:
+        log_start_offset = log_path.stat().st_size
+    except OSError:
+        log_start_offset = 0
+    try:
+        with connect_closing(board=board) as evidence_conn:
+            with write_txn(evidence_conn):
+                _merge_current_run_metadata(evidence_conn, task.id, {
+                    "attempted_spawn_cwd": str(workspace),
+                    "attempted_spawn_log_path": str(log_path),
+                    "attempted_spawn_log_start_offset": log_start_offset,
+                    "assignee": task.assignee,
+                })
+    except Exception:
+        pass
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")

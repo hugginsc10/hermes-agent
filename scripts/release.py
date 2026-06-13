@@ -45,6 +45,7 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "hugginsc10@gmail.com": "hugginsc10",  # fork operator
     "peterhao@Peters-MacBook-Air.local": "pinguarmy",
     "barronlroth@gmail.com": "barronlroth",
     "ondrej.drapalik@gmail.com": "OndrejDrapalik",
@@ -63,6 +64,7 @@ AUTHOR_MAP = {
     "thomas.paquette@gmail.com": "RyTsYdUp",
     "techxacm@gmail.com": "ProgramCaiCai",
     "266365592+bmoore210@users.noreply.github.com": "bmoore210",
+    "123150002+deaneeth@users.noreply.github.com": "deaneeth",
     "157839748+psionic73@users.noreply.github.com": "psionic73",
     "manishbyatroy@gmail.com": "manishbyatroy",
     "chilltulpa@gmail.com": "TheGardenGallery",
@@ -75,6 +77,8 @@ AUTHOR_MAP = {
     "129007007+HeLLGURD@users.noreply.github.com": "HeLLGURD",
     "290859878+synapsesx@users.noreply.github.com": "synapsesx",
     "dirtyren@users.noreply.github.com": "dirtyren",
+    "kdunn926@gmail.com": "kdunn926",
+    "mvanhorn@MacBook-Pro.local": "mvanhorn",
     "470766206@qq.com": "youjunxiaji",
     "mharris@parallel.ai": "NormallyGaussian",
     "roger@roger.local": "mollusk",
@@ -1515,6 +1519,8 @@ AUTHOR_MAP = {
     "josephjohnson.joel@gmail.com": "JoelJJohnson",  # PR #39913 salvage (Windows ConPTY dashboard chat bridge)
     "andreas@schwarz-ketsch.de": "Nea74",  # PR #40022 co-author credit (same Windows ConPTY bridge design)
     "chanhokyim@gmail.com": "joel611",  # PR #33958 salvage (DISCORD_ALLOWED_ROLES role_authorized gateway flag)
+    "desg38@gmail.com": "dschnurbusch",  # PR #42373 salvage (archive compressed conversation lineages)
+    "bsmith@bramarstrategicservices.com": "bcsmith528",  # PR #20589 salvage (register_slack_action_handler plugin API)
 }
 
 

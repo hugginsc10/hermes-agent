@@ -4535,3 +4535,168 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_dispatch_records_spawn_attempt_evidence(kanban_home, all_assignees_spawnable):
+    def _spawn(task, ws):
+        return 99999
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="evidence", assignee="worker")
+        res = kb.dispatch_once(conn, spawn_fn=_spawn)
+        assert res.spawned and res.spawned[0][0] == tid
+        run = kb.list_runs(conn, tid)[0]
+        assert run.metadata["attempted_spawn_cwd"] == kb.get_task(conn, tid).workspace_path
+        assert run.metadata["attempted_spawn_log_path"].endswith(f"{tid}.log")
+        assert run.metadata["attempted_spawn_log_start_offset"] == 0
+        assert run.metadata["assignee"] == "worker"
+    finally:
+        conn.close()
+
+
+def test_provider_auth_exit_blocks_with_log_evidence(kanban_home, all_assignees_spawnable):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="auth", assignee="worker")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        kb.set_workspace_path(conn, tid, str(kanban_home / "workspaces" / tid))
+        pid = 987654321
+        kb._set_worker_pid(conn, tid, pid)
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("OpenAI Codex OAuth failed: HTTP 401 token_expired rejected-token\n", encoding="utf-8")
+        kb._record_worker_exit(pid, 1 << 8)
+
+        crashed = kb.detect_crashed_workers(conn)
+
+        assert tid in crashed
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.last_failure_error and "auth-required/provider-auth" in task.last_failure_error
+        run = kb.list_runs(conn, tid)[0]
+        assert run.outcome == "provider_auth_required"
+        assert run.status == "blocked"
+        assert run.metadata["provider_auth_detail"] == "token_expired"
+        assert "token_expired" in run.metadata["log_excerpt"]
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "provider_auth_required" for e in events)
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("text,expected", [
+    # Positives: explicit provider-auth failure context.
+    ("HTTP/1.1 401 Unauthorized", "http-401"),
+    ("request failed with status code: 401", "http-401"),
+    ("openai.AuthenticationError: invalid x-api-key", "invalid-api-key"),
+    ("anthropic returned error: invalid_api_key", "invalid-api-key"),
+    ("OAuth refresh failed: token_expired", "token_expired"),
+    ("provider said: rejected-token", "rejected-token"),
+    ("oauth2 access token could not be validated", "oauth-token-invalid"),
+    # Negatives: bare/ambiguous matches must NOT classify as auth.
+    ("processed record 401 of 9000", None),
+    ("line 401: token_processed", None),
+    ("user attempted unauthorized file access (audit log)", None),
+    ("SyntaxError: invalid token at position 3", None),
+    ("OAuth2 access token successfully validated", None),
+    ("implement unauthorized-access detection for the firewall", None),
+])
+def test_provider_auth_detail_classification(text, expected):
+    assert kb._provider_auth_failure_detail(text) == expected
+
+
+def test_provider_auth_block_is_sticky_and_not_repromoted(kanban_home, all_assignees_spawnable):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="auth-sticky", assignee="worker")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        kb.set_workspace_path(conn, tid, str(kanban_home / "workspaces" / tid))
+        pid = 987654322
+        kb._set_worker_pid(conn, tid, pid)
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("OAuth failed: HTTP 401 Unauthorized token_expired\n", encoding="utf-8")
+        kb._record_worker_exit(pid, 1 << 8)
+
+        kb.detect_crashed_workers(conn)
+
+        events = kb.list_events(conn, tid)
+        blocked = [e for e in events if e.kind == "blocked"]
+        assert blocked, "provider-auth classification must leave a sticky blocked event"
+        assert blocked[-1].payload["reason"].startswith("provider-auth-required:")
+        # The block must survive recompute_ready: without the sticky
+        # event the task silently respawns against dead credentials.
+        kb.recompute_ready(conn)
+        assert kb.get_task(conn, tid).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_provider_auth_excerpt_is_redacted(kanban_home, all_assignees_spawnable):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="auth-redact", assignee="worker")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        kb.set_workspace_path(conn, tid, str(kanban_home / "workspaces" / tid))
+        pid = 987654323
+        kb._set_worker_pid(conn, tid, pid)
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "Authorization: Bearer fake-credential-aaaabbbbcccc1111\n"
+            "HTTP 401 Unauthorized: token_expired\n",
+            encoding="utf-8",
+        )
+        kb._record_worker_exit(pid, 1 << 8)
+
+        kb.detect_crashed_workers(conn)
+
+        run = kb.list_runs(conn, tid)[0]
+        assert run.outcome == "provider_auth_required"
+        assert "fake-credential-aaaabbbbcccc1111" not in run.metadata["log_excerpt"]
+        assert "token_expired" in run.metadata["log_excerpt"]
+        events = kb.list_events(conn, tid)
+        auth_events = [e for e in events if e.kind == "provider_auth_required"]
+        assert auth_events and "fake-credential-aaaabbbbcccc1111" not in auth_events[-1].payload["log_excerpt"]
+    finally:
+        conn.close()
+
+
+def test_generic_crash_records_redacted_log_excerpt(kanban_home, all_assignees_spawnable):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="crash-evidence", assignee="worker")
+        task = kb.claim_task(conn, tid)
+        assert task is not None
+        kb.set_workspace_path(conn, tid, str(kanban_home / "workspaces" / tid))
+        pid = 987654324
+        kb._set_worker_pid(conn, tid, pid)
+        log_path = kb.worker_logs_dir() / f"{tid}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "Traceback (most recent call last):\n  ValueError: boom\n"
+            "Authorization: Bearer fake-credential-zzzzyyyy2222\n",
+            encoding="utf-8",
+        )
+        kb._record_worker_exit(pid, 1 << 8)
+
+        kb.detect_crashed_workers(conn)
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", "non-auth crash must keep the crash->ready path"
+        run = kb.list_runs(conn, tid)[0]
+        assert run.outcome == "crashed"
+        assert "ValueError: boom" in run.metadata["log_excerpt"]
+        assert "fake-credential-zzzzyyyy2222" not in run.metadata["log_excerpt"]
+    finally:
+        conn.close()
+
+
+def test_worker_log_excerpt_missing_file_degrades(kanban_home):
+    payload = kb._worker_log_excerpt_for_task("t_does_not_exist")
+    assert "log_error" in payload
+    assert "log_excerpt" not in payload
