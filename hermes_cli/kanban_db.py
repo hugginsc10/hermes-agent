@@ -5117,6 +5117,82 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# PIDs of spawned workers with a live per-spawn waiter thread (see
+# ``_spawn_worker_exit_waiter``). While any waiter is alive,
+# ``reap_worker_zombies`` must NOT run its ``waitpid(-1)`` sweep — it
+# would steal exit statuses out from under ``Popen.wait()`` (which then
+# reports a false rc=0 via CPython's ECHILD fallback). The sweep stays
+# as a fallback for processes with no waiter (legacy spawns, exotic
+# callers).
+_worker_waiter_pids: "set[int]" = set()
+
+
+def _rc_to_raw_status(rc: int) -> int:
+    """Convert a ``Popen.returncode`` to a ``waitpid``-style raw status.
+
+    ``Popen`` reports normal exits as ``rc >= 0`` and signal deaths as
+    ``-signum``. The reap registry stores raw statuses so
+    ``_classify_worker_exit`` can use ``os.WIFEXITED``/``os.WIFSIGNALED``
+    uniformly regardless of which observer reaped the child.
+    """
+    if rc >= 0:
+        return (int(rc) & 0xFF) << 8
+    return (-int(rc)) & 0x7F
+
+
+def _record_worker_exit_rc(pid: int, rc: Optional[int]) -> None:
+    """Record a worker exit observed via ``Popen.wait()`` (returncode form).
+
+    Never overwrites an existing registry entry: if ``reap_worker_zombies``
+    won the race and consumed the status via ``waitpid(-1)``, the waiter's
+    ``Popen.wait()`` returns a synthetic rc=0 (CPython ``_try_wait`` ECHILD
+    fallback) which must not clobber the authoritative raw status.
+    """
+    if rc is None or not pid or pid <= 0:
+        return
+    if int(pid) in _recent_worker_exits:
+        return
+    _record_worker_exit(int(pid), _rc_to_raw_status(int(rc)))
+
+
+def _spawn_worker_exit_waiter(proc) -> None:
+    """Hold the worker's ``Popen`` handle and record its exit status.
+
+    Root-cause fix for the "pid N not alive" misclassification storm
+    (201 runs): ``_default_spawn`` historically abandoned its ``Popen``
+    handle, CPython parked the live child in ``subprocess._active``, and
+    ANY later subprocess creation in the gateway (including the per-row
+    ``ps`` probe inside ``_pid_alive`` on macOS) triggered
+    ``subprocess._cleanup()``, which silently ``waitpid()``ed the corpse
+    and discarded its status before ``reap_worker_zombies`` could record
+    it — so ``_classify_worker_exit`` returned ``unknown`` and every
+    death became a generic crash with no exit-code evidence.
+
+    Holding the ``Popen`` reference in this thread's closure keeps it
+    out of ``subprocess._active`` (no GC → no ``__del__`` → never
+    eligible for ``_cleanup()`` theft), and ``proc.wait()`` records the
+    real returncode the moment the child dies.
+    """
+    import threading
+
+    pid = int(proc.pid)
+    _worker_waiter_pids.add(pid)
+
+    def _wait_and_record(proc=proc, pid=pid):
+        try:
+            rc = proc.wait()
+            _record_worker_exit_rc(pid, rc)
+        except Exception:
+            pass
+        finally:
+            _worker_waiter_pids.discard(pid)
+
+    threading.Thread(
+        target=_wait_and_record,
+        daemon=True,
+        name=f"kanban-worker-waiter-{pid}",
+    ).start()
+
 
 def _record_worker_exit(pid: int, raw_status: int) -> None:
     """Record a reaped child's exit status for later classification.
@@ -5185,13 +5261,22 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
 
 
 def reap_worker_zombies() -> "list[int]":
-    """Reap all zombie children of this process without blocking.
+    """Reap zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
+
+    FALLBACK ONLY while waiter threads are live: every worker spawned by
+    ``_default_spawn`` now has a dedicated waiter thread blocked in
+    ``Popen.wait()`` (see ``_spawn_worker_exit_waiter``). Running a
+    ``waitpid(-1)`` sweep concurrently would consume those children's
+    statuses out from under their waiters (the waiter's ``Popen.wait()``
+    would then report a synthetic rc=0 via the ECHILD fallback). The
+    sweep therefore only runs when no waiter is alive — covering
+    children spawned by legacy paths and pre-upgrade gateway processes.
     """
     reaped: "list[int]" = []
-    if os.name != "nt":
+    if os.name != "nt" and not _worker_waiter_pids:
         try:
             while True:
                 try:
@@ -7221,8 +7306,16 @@ def _default_spawn(
     # NOTE: we intentionally do NOT close log_f here — we want Popen's
     # child process to keep writing after this function returns.  The
     # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    # reference goes out of scope, but the OS-level FD stays open in the
+    # child until the child exits.
+    #
+    # The Popen handle itself is NOT abandoned anymore: a per-spawn
+    # waiter thread holds the reference and records the real exit status
+    # the moment the child dies, so ``_classify_worker_exit`` stops
+    # returning "unknown" ("pid N not alive") whenever an unrelated
+    # subprocess creation in this process triggered
+    # ``subprocess._cleanup()`` ahead of the reap tick.
+    _spawn_worker_exit_waiter(proc)
     return proc.pid
 
 
