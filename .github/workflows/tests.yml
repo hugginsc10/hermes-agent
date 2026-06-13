@@ -173,6 +173,13 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Same head-sha pin as the test job: e2e also discovers files
+          # (pytest tests/e2e/) on pull_request, so a stale refs/pull/N/merge
+          # missing a just-added e2e test would fail spuriously. e2e isn't
+          # sharded so it can't hit the deterministic slicer failure, but the
+          # pin keeps file presence consistent and the two jobs symmetric.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install ripgrep (prebuilt binary)
         run: |
