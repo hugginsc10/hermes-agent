@@ -1234,10 +1234,16 @@ red flag.
 Until a `post-merge` / `PROTECTED_PATHS` guard is installed in the global
 hooksPath, **do NOT run `git merge upstream/main`, `git merge origin/main`,
 or any `git reset --hard origin/main` on the live checkout
-(`~/.hermes/hermes-agent`).** The global hooks are only `pre-commit` /
-`commit-msg` — neither fires on `merge` or `reset`, so these ops are currently
-unguarded against clobbering the fork line. Upstream integration happens in a
-dedicated Olympus clone during an operator-scheduled idle window, never here.
+(`~/.hermes/hermes-agent`) — and do NOT run `hermes update` here.** The global
+hooks are only `pre-commit` / `commit-msg` — neither fires on `merge` or
+`reset`, so these ops are currently unguarded against clobbering the fork line.
+⚠️ `hermes update` is especially dangerous: on a diverged fast-forward pull it
+**auto-runs `git reset --hard origin/<branch>` with no prompt**
+(`hermes_cli/main.py:8467`) — on this checkout `origin` = public Nous, so it
+will clobber local main's tip and any uncommitted in-flight work. It must be
+made fork-aware (or origin-guarded) before it is safe to run here. Upstream
+integration happens in a dedicated Olympus clone during an operator-scheduled
+idle window, never here.
 
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
