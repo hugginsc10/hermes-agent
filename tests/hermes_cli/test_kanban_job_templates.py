@@ -358,3 +358,32 @@ def test_load_job_template_end_to_end_through_default_fetcher(monkeypatch):
     monkeypatch.setattr(hindsight_client, "Hindsight", _FakeHindsight)
     tmpl = jt.load_job_template(BOARD, assignee="builder", use_cache=False)
     assert tmpl is not None and tmpl.require_refuter is True
+
+
+def test_has_template_tags_is_strict():
+    assert jt._has_template_tags(_FakeDirective("{}", list(jt.TEMPLATE_TAGS))) is True
+    # Missing one of the required tags → not a template.
+    assert jt._has_template_tags(_FakeDirective("{}", ["project:olympus-dispatcher"])) is False
+    assert jt._has_template_tags(_FakeDirective("{}", [])) is False
+    assert jt._has_template_tags(_FakeDirective("{}", None)) is False
+
+
+def test_default_fetcher_skips_untagged_json_directive(monkeypatch):
+    import hindsight_client
+
+    class _MixedHindsight(_FakeHindsight):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self._directives_api = _FakeDirectivesApi(
+                [
+                    _FakeDirective(json.dumps(_board_default()), list(jt.TEMPLATE_TAGS)),
+                    # Valid JSON, but NOT namespaced as a job-template → must be ignored,
+                    # even though Hindsight's loose tag filter returned it.
+                    _FakeDirective(json.dumps(_assignee_tmpl("builder")), ["some:other-tag"]),
+                ]
+            )
+
+    monkeypatch.setattr(hindsight_client, "Hindsight", _MixedHindsight)
+    raw = jt._default_fetcher()
+    assert len(raw) == 1
+    assert raw[0]["selector"]["kind"] == "board-default"

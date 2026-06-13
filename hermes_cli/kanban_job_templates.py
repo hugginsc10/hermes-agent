@@ -225,6 +225,19 @@ def _get_field(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
+def _has_template_tags(directive: Any) -> bool:
+    """True only if the directive carries every tag in :data:`TEMPLATE_TAGS`.
+
+    Hindsight's tag filter matches loosely (untagged directives come back too),
+    so we re-check strictly here — a directive is a job-template only if it is
+    explicitly namespaced, never by accident of also being valid JSON."""
+    tags = _get_field(directive, "tags") or ()
+    if not isinstance(tags, (list, tuple, set)):
+        return False
+    tagset = set(tags)
+    return all(t in tagset for t in TEMPLATE_TAGS)
+
+
 def _run_coro(coro: Any) -> Any:
     """Run an async coroutine to completion from a sync context.
 
@@ -276,6 +289,8 @@ def _default_fetcher() -> list[dict]:
 
     raw: list[dict] = []
     for directive in _iter_directive_items(items):
+        if not _has_template_tags(directive):
+            continue  # strict: only explicitly namespaced job-template directives
         content = _get_field(directive, "content")
         if not isinstance(content, str) or not content.strip():
             continue
