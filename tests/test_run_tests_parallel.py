@@ -293,3 +293,78 @@ def test_file_present_reports_truly_missing(tmp_path, monkeypatch):
     f = tmp_path / "nope.py"
     monkeypatch.setattr(rtp.Path, "exists", lambda self: False)
     assert rtp._file_present(f, attempts=3, delay=0.0) is False
+
+
+# ---------------------------------------------------------------------------
+# exit-4 self-heal: a committed file missing from the slice's working tree
+# (the checkout/merge-ref race) is restored from HEAD and re-run.
+# ---------------------------------------------------------------------------
+
+def _init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=root, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=root, check=True)
+
+
+def _git_commit(root: Path, rel: str) -> None:
+    subprocess.run(["git", "add", rel], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-q", "--no-verify", "-m", "add"], cwd=root, check=True)
+
+
+def test_git_has_in_head_distinguishes_committed_files(tmp_path):
+    rtp = _load_runner_module()
+    _init_git_repo(tmp_path)
+    f = tmp_path / "test_x.py"
+    f.write_text("x = 1\n")
+    _git_commit(tmp_path, "test_x.py")
+    assert rtp._git_has_in_head("test_x.py", tmp_path) is True
+    assert rtp._git_has_in_head("test_missing.py", tmp_path) is False
+
+
+def test_self_heal_restores_committed_file_missing_from_worktree(tmp_path, monkeypatch):
+    """A file in HEAD but vanished from the working tree (the checkout race) is
+    restored from HEAD and the test run recovers — instead of a hard exit-4."""
+    rtp = _load_runner_module()
+    _init_git_repo(tmp_path)
+    f = tmp_path / "test_committed.py"
+    f.write_text("def test_ok():\n    assert True\n")
+    _git_commit(tmp_path, "test_committed.py")
+    f.unlink()  # simulate the slice's checkout missing the committed file
+    assert not f.exists()
+
+    def fake_spawn(cmd, repo_root, file_timeout, *, timeout_note="per-file timeout"):
+        # exit-4 while the file is missing; pass once self-heal restores it.
+        return (0, "1 passed") if f.exists() else (4, "ERROR: file or directory not found")
+
+    monkeypatch.setattr(rtp, "_spawn_pytest_once", fake_spawn)
+    monkeypatch.setattr(rtp, "_EXIT4_RETRY_BACKOFF_SECONDS", 0.0)
+
+    _file, rc, output, _summary, _wall = rtp._run_one_file(f, [], tmp_path, 30.0)
+    assert f.exists(), "self-heal should have restored the file from HEAD"
+    assert rc == 0, f"expected pass after restore, got rc={rc}, output={output!r}"
+
+
+def test_no_self_heal_when_file_not_in_head(tmp_path, monkeypatch):
+    """A file that is NOT in the checked-out commit cannot be restored — it must
+    still fail with exit-4, and the forensics must attribute it (in_head=False)."""
+    rtp = _load_runner_module()
+    _init_git_repo(tmp_path)
+    # Make HEAD non-empty (so `git cat-file HEAD:` resolves) but WITHOUT our file.
+    (tmp_path / "seed.txt").write_text("seed\n")
+    _git_commit(tmp_path, "seed.txt")
+    missing = tmp_path / "test_uncommitted.py"  # never created, never committed
+
+    calls = {"n": 0}
+
+    def fake_spawn(cmd, repo_root, file_timeout, *, timeout_note="per-file timeout"):
+        calls["n"] += 1
+        return 4, "ERROR: file or directory not found"
+
+    monkeypatch.setattr(rtp, "_spawn_pytest_once", fake_spawn)
+    monkeypatch.setattr(rtp, "_EXIT4_RETRY_BACKOFF_SECONDS", 0.0)
+
+    _file, rc, output, _summary, _wall = rtp._run_one_file(missing, [], tmp_path, 30.0)
+    assert rc == 4, "a file genuinely absent from HEAD must keep failing"
+    assert calls["n"] == 1, "no retry (missing) and no self-heal spawn"
+    assert "in_head=False" in output, f"forensics must record in_head=False; got:\n{output}"
