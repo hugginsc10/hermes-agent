@@ -338,6 +338,43 @@ def _file_present(file: Path, *, attempts: int = 3, delay: float = 0.2) -> bool:
     return False
 
 
+def _git_has_in_head(rel: str, repo_root: Path) -> bool:
+    """True if ``rel`` exists in the checked-out commit (``HEAD``).
+
+    Distinguishes the two exit-4 root causes: a file that IS in HEAD but missing
+    on disk is a working-tree race (recoverable); a file that is NOT in HEAD
+    means this checkout's commit genuinely lacks it (e.g. a slice landed on a
+    stale pull-request merge ref predating the file) — a checkout/infra problem.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "cat-file", "-e", f"HEAD:{rel}"],
+            cwd=repo_root, capture_output=True, timeout=10,
+        )
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001 — never let a git probe mask the real rc
+        return False
+
+
+def _restore_from_head(file: Path, rel: str, repo_root: Path) -> bool:
+    """Restore ``file`` from ``HEAD`` if it's tracked there but missing on disk.
+
+    Returns True iff the file exists on disk afterwards. Only ever touches a file
+    that is genuinely part of the checked-out commit, so it cannot manufacture a
+    pass for a file that the checkout legitimately lacks.
+    """
+    if file.exists() or not _git_has_in_head(rel, repo_root):
+        return file.exists()
+    try:
+        subprocess.run(
+            ["git", "checkout", "--", rel],
+            cwd=repo_root, capture_output=True, timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return file.exists()
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
@@ -395,6 +432,19 @@ def _run_one_file(
             timeout_note=f"per-file timeout on exit-4 retry {attempt}",
         )
 
+    rel = _format_file(file, repo_root)
+    # Self-heal a working-tree race: the file is in the checked-out commit
+    # (HEAD) but absent from disk. Restore it from HEAD and run once more. A file
+    # that is NOT in HEAD (e.g. a slice that checked out a stale pull-request
+    # merge ref predating the file's commit) cannot be restored here — that is a
+    # checkout/infra problem (now mitigated by pinning the workflow checkout to
+    # the PR head sha) and it still surfaces as a real exit-4 below.
+    if rc == 4 and not file.exists() and _restore_from_head(file, rel, repo_root):
+        rc, output = _spawn_pytest_once(
+            cmd, repo_root, file_timeout,
+            timeout_note="per-file timeout on exit-4 restore retry",
+        )
+
     if rc == 4:
         # Exit-4 survived the retries (or the file was judged absent).
         # Capture filesystem forensics so a CI-only "file not found" can
@@ -405,7 +455,14 @@ def _run_one_file(
         # the next occurrence is attributable.)
         forensics = [f"--- exit-4 forensics for {file} ---"]
         try:
-            forensics.append(f"exists={file.exists()} retries_used={attempt}")
+            # in_head distinguishes a checkout that lacks the committed file
+            # (in_head=False → stale merge ref / checkout-infra bug) from a
+            # working-tree race (in_head=True, exists=False → self-heal should
+            # have recovered it).
+            forensics.append(
+                f"exists={file.exists()} in_head={_git_has_in_head(rel, repo_root)} "
+                f"retries_used={attempt}"
+            )
             parent = file.parent
             if parent.exists():
                 names = sorted(p.name for p in parent.iterdir())
