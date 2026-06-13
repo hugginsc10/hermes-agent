@@ -274,6 +274,50 @@ def _normalize_profile(value: Any) -> Optional[str]:
     return text
 
 
+_VERIFICATION_BLOCK_PREFIXES = ("review-required:", "spot-check-required:")
+
+
+def _active_profile_name() -> str:
+    """Best-effort active Hermes profile name for policy checks."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return (get_active_profile_name() or "default").strip() or "default"
+    except Exception:
+        return "default"
+
+
+def _artifact_paths_from_metadata(metadata: Optional[dict]) -> list[str]:
+    """Return a normalized artifact-path list from completion metadata."""
+    if not isinstance(metadata, dict):
+        return []
+    raw = metadata.get("artifacts")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            normalized.append(text)
+    return normalized
+
+
+def _task_has_verification_block(kb: Any, conn: Any, task_id: str) -> bool:
+    """True when a task previously handed off via review-/spot-check gate."""
+    for event in kb.list_events(conn, task_id):
+        if getattr(event, "kind", None) != "blocked":
+            continue
+        payload = getattr(event, "payload", None) or {}
+        reason = str(payload.get("reason") or "").strip().lower()
+        if any(reason.startswith(prefix) for prefix in _VERIFICATION_BLOCK_PREFIXES):
+            return True
+    return False
+
+
 def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
     value = args.get(name)
     if value is None:
@@ -553,6 +597,33 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            task = kb.get_task(conn, tid)
+            if not task:
+                return tool_error(
+                    f"could not complete {tid} (unknown id or already terminal)"
+                )
+            task_assignee = _normalize_profile(getattr(task, "assignee", None))
+            if task_assignee == "builder" or _active_profile_name() == "builder":
+                return tool_error(
+                    "kanban_complete blocked: builder-assigned work cannot self-"
+                    "complete. Post a kanban_comment with changed files, tests, "
+                    "evidence, and artifact paths, then hand off with "
+                    "kanban_block(reason=\"review-required: ...\") or "
+                    "kanban_block(reason=\"spot-check-required: ...\") when "
+                    "verification cannot be automated. Your task is still in-"
+                    "flight (no state change)."
+                )
+            if (
+                _task_has_verification_block(kb, conn, tid)
+                and not _artifact_paths_from_metadata(metadata)
+            ):
+                return tool_error(
+                    "kanban_complete blocked: tasks resuming from a review-"
+                    "required or spot-check-required handoff must attach at "
+                    "least one verification artifact via artifacts=[...] or "
+                    "metadata['artifacts']=[...]. Your task is still in-flight "
+                    "(no state change)."
+                )
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -982,8 +1053,10 @@ KANBAN_COMPLETE_SCHEMA = {
         "Mark your current task done with a structured handoff for "
         "downstream workers and humans. Prefer ``summary`` for a "
         "human-readable 1-3 sentence description of what you did; put "
-        "machine-readable facts in ``metadata`` (changed_files, "
-        "tests_run, decisions, findings, etc). At least one of "
+        "machine-readable facts in ``metadata``. Expected keys are "
+        "``outcome``, ``files_changed`` (or legacy ``changed_files``), "
+        "``tests_run``, ``evidence``, ``risks``, and ``follow_ups``; "
+        "use empty lists/strings when a key is not applicable. At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
@@ -993,7 +1066,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. Builder-"
+        "assigned implementation tasks cannot self-complete: hand off with "
+        "`review-required:` or `spot-check-required:` instead. Tasks that "
+        "resume from one of those verification gates must attach at least "
+        "one artifact path when they finally complete."
     ),
     "parameters": {
         "type": "object",
@@ -1014,8 +1091,10 @@ KANBAN_COMPLETE_SCHEMA = {
                 "type": "object",
                 "description": (
                     "Free-form dict of structured facts about this "
-                    "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    "attempt. Preferred shape: {\"outcome\": \"...\", "
+                    "\"files_changed\": [...], \"tests_run\": [...], "
+                    "\"evidence\": [...], \"risks\": [...], "
+                    "\"follow_ups\": [...]}. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
             },
@@ -1076,7 +1155,11 @@ KANBAN_BLOCK_SCHEMA = {
         "to proceed. ``reason`` will be shown to the human on the "
         "board and included in context when someone unblocks you. "
         "Use for genuine blockers only — don't block on things you can "
-        "resolve yourself."
+        "resolve yourself. For high-quality blocker handoffs, include "
+        "the exact blocker, steps tried, and specific input needed; put "
+        "longer context/evidence/risks in a prior ``kanban_comment``. "
+        "For implementation review handoffs, prefix the reason with "
+        "`review-required:` or `spot-check-required:`."
     ),
     "parameters": {
         "type": "object",
@@ -1089,8 +1172,10 @@ KANBAN_BLOCK_SCHEMA = {
                 "type": "string",
                 "description": (
                     "What you need answered, in one or two sentences. "
-                    "Don't paste the whole conversation; the human has "
-                    "the board and can ask follow-ups via comments."
+                    "Name the exact blocker, the steps already tried, "
+                    "and the input needed to proceed. Don't paste the "
+                    "whole conversation; the human has the board and "
+                    "can ask follow-ups via comments."
                 ),
             },
             "board": _board_schema_prop(),

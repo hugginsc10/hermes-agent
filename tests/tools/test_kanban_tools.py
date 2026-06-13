@@ -61,6 +61,33 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
 
+def test_kanban_handoff_quality_templates_in_tool_schemas():
+    """Tool descriptions should reinforce completion/block handoff shape."""
+    from tools import kanban_tools as kt
+
+    complete_schema = json.dumps(kt.KANBAN_COMPLETE_SCHEMA)
+    block_schema = json.dumps(kt.KANBAN_BLOCK_SCHEMA)
+
+    handoff_tokens = [
+        "outcome",
+        "files_changed",
+        "tests_run",
+        "evidence",
+        "risks",
+        "follow_ups",
+    ]
+    for token in handoff_tokens:
+        assert token in complete_schema
+    assert "review-required:" in complete_schema
+    assert "spot-check-required:" in complete_schema
+    assert "artifact" in complete_schema
+    assert "exact blocker" in block_schema
+    assert "steps" in block_schema
+    assert "input needed" in block_schema
+    assert "review-required:" in block_schema
+    assert "spot-check-required:" in block_schema
+
+
 def test_kanban_worker_env_overrides_profile_toolset_filter(monkeypatch, tmp_path):
     """Dispatcher-spawned workers must get lifecycle tools even when the
     assignee profile restricts enabled toolsets and does not list kanban.
@@ -494,6 +521,107 @@ def test_complete_rejects_non_dict_metadata(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({"summary": "x", "metadata": [1, 2, 3]})
     assert json.loads(out).get("error")
+
+
+def test_builder_assigned_task_cannot_self_complete(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="builder task", assignee="builder")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({"summary": "implemented the feature"})
+    err = json.loads(out).get("error", "")
+    assert "builder-assigned work cannot self-complete" in err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_review_required_completion_rejects_missing_artifacts(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewer task", assignee="reviewer")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        kb.block_task(
+            conn,
+            tid,
+            reason="review-required: verify the diff",
+            expected_run_id=run.id,
+        )
+        assert kb.unblock_task(conn, tid) is True
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({"summary": "review passed but I forgot the artifact"})
+    err = json.loads(out).get("error", "")
+    assert "must attach at least one verification artifact" in err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+    finally:
+        conn.close()
+
+
+def test_review_required_completion_accepts_artifacts(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="reviewer task", assignee="reviewer")
+        kb.claim_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        kb.block_task(
+            conn,
+            tid,
+            reason="review-required: verify the diff",
+            expected_run_id=run.id,
+        )
+        assert kb.unblock_task(conn, tid) is True
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    out = kt._handle_complete({
+        "summary": "review passed with artifact-backed verification",
+        "artifacts": ["/tmp/reviewer-verdict.md"],
+    })
+    assert json.loads(out).get("ok") is True
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+        assert task is not None
+        assert task.status == "done"
+        assert run is not None
+        metadata = run.metadata or {}
+        assert metadata.get("artifacts") == ["/tmp/reviewer-verdict.md"]
+    finally:
+        conn.close()
 
 
 def test_complete_phantom_card_message_advertises_retry(worker_env):
@@ -1219,6 +1347,12 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
     assert "kanban_create" in prompt
+    # Handoff quality template signals
+    assert "files_changed" in prompt
+    assert "tests_run" in prompt
+    assert "evidence" in prompt
+    assert "exact blocker" in prompt
+    assert "specific input needed" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 
@@ -1415,7 +1549,11 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     try:
         run1 = kb.latest_run(conn, worker_env)
         kb._set_worker_pid(conn, worker_env, 98765)
-        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        # Backdate the synthetic worker past the launch grace period so this
+        # test exercises stale-run rejection rather than fresh-spawn crash
+        # suppression, even if the grace env var default changes.
+        conn.execute("UPDATE tasks SET started_at = ? WHERE id = ?", (0, worker_env))
+        conn.commit()
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [worker_env]
 
