@@ -1216,12 +1216,28 @@ guards and be dispatched inline, not via `_process_message_background()`
 (which races session lifecycle).
 
 ### Squash merges from stale branches silently revert recent fixes
-Before squash-merging a PR, ensure the branch is up to date with `main`
-(`git fetch origin main && git reset --hard origin/main` in the worktree,
+Before squash-merging a PR, ensure the branch is up to date with the **fork
+line** (`git fetch fork main && git reset --hard fork/main` in the worktree,
 then re-apply the PR's commits). A stale branch's version of an unrelated
 file will silently overwrite recent fixes on main when squashed. Verify
 with `git diff HEAD~1..HEAD` after merging — unexpected deletions are a
 red flag.
+
+> ⚠️ **NEVER `git reset --hard origin/main` on this checkout.** Here `origin`
+> = the **PUBLIC NousResearch upstream**, and local `main` runs ~37 commits
+> ahead of it carrying the un-pushed Olympus fork line. Resetting to
+> `origin/main` **permanently destroys those commits**, and `git reset --hard`
+> fires **no git hook**, so nothing catches it. The Olympus integration line
+> is `fork/main` (→ hugginsc10), never `origin` (→ Nous).
+
+### 🧊 FREEZE — interim, until the upstream-merge gate lands
+Until a `post-merge` / `PROTECTED_PATHS` guard is installed in the global
+hooksPath, **do NOT run `git merge upstream/main`, `git merge origin/main`,
+or any `git reset --hard origin/main` on the live checkout
+(`~/.hermes/hermes-agent`).** The global hooks are only `pre-commit` /
+`commit-msg` — neither fires on `merge` or `reset`, so these ops are currently
+unguarded against clobbering the fork line. Upstream integration happens in a
+dedicated Olympus clone during an operator-scheduled idle window, never here.
 
 ### Don't wire in dead code without E2E validation
 Unused code that was never shipped was dead for a reason. Before wiring an
