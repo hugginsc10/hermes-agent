@@ -2694,23 +2694,27 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         rows = conn.execute(
             "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
         ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
-            kb._rescue_unpushed_git_work(path, row["id"])
-            shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+        scratch_root_resolved = scratch_root.resolve()
+        for row in rows:
+            if row["workspace_kind"] != "scratch":
+                continue
+            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            try:
+                path.relative_to(scratch_root_resolved)
+            except ValueError:
+                # Safety: never delete outside the scratch root.
+                continue
+            # Never delete a scratch dir a live worker is still cwd'd in.
+            if kb._workspace_has_live_worker_cwd(conn, path):
+                continue
+            if path.exists() and path.is_dir():
+                kb._rescue_unpushed_git_work(path, row["id"])
+                shutil.rmtree(path, ignore_errors=True)
+                removed_ws += 1
 
     event_days = getattr(args, "event_retention_days", 30)
     log_days = getattr(args, "log_retention_days", 30)
