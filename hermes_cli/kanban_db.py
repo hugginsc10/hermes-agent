@@ -4009,6 +4009,61 @@ def find_rescue_manifests(task_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def _workspace_has_live_worker_cwd(
+    conn: sqlite3.Connection,
+    workspace_path: Path,
+    *,
+    protected_pid: Optional[int] = None,
+) -> bool:
+    """Return True when removing ``workspace_path`` would delete a live worker cwd.
+
+    Kanban workers are spawned with their task workspace as cwd. Deleting a
+    workspace that any *currently-running* task is still inside would pull the
+    rug out from under that worker. This scans the DB for live ``worker_pid``
+    rows whose ``workspace_path`` is the target (or nested under it) and reports
+    a conflict, so cleanup paths can skip those dirs. ``protected_pid`` lets a
+    caller additionally guard a just-cleared PID (e.g. a completing worker).
+    """
+    try:
+        target = workspace_path.resolve(strict=False)
+    except OSError:
+        return False
+
+    def _path_contains_live_cwd(live_workspace: "str | os.PathLike[str]") -> bool:
+        try:
+            live_path = Path(live_workspace).expanduser().resolve(strict=False)
+        except OSError:
+            return False
+        if live_path == target:
+            return True
+        try:
+            return live_path.is_relative_to(target)
+        except ValueError:
+            return False
+
+    if protected_pid and _pid_alive(protected_pid):
+        return True
+
+    try:
+        rows = conn.execute(
+            "SELECT worker_pid, workspace_path FROM tasks "
+            "WHERE worker_pid IS NOT NULL AND workspace_path IS NOT NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        pid = row["worker_pid"]
+        live_workspace = row["workspace_path"]
+        if (
+            pid
+            and live_workspace
+            and _pid_alive(int(pid))
+            and _path_contains_live_cwd(live_workspace)
+        ):
+            return True
+    return False
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
 

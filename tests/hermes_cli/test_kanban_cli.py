@@ -538,6 +538,30 @@ def test_run_slash_subcommand_help_returns_help_text(kanban_home):
     assert not out.startswith("⚠")
 
 
+def test_gc_skips_archived_workspace_used_by_live_worker_cwd(kanban_home):
+    """GC must not delete an archived scratch dir while its worker PID lives."""
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="archived live cwd")
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+        kb.set_workspace_path(conn, task_id, ws)
+        (ws / "artifact.txt").write_text("still needed", encoding="utf-8")
+        conn.execute(
+            "UPDATE tasks SET status = 'archived', worker_pid = ? WHERE id = ?",
+            (os.getpid(), task_id),
+        )
+        conn.commit()
+
+    result = kc._cmd_gc(
+        argparse.Namespace(event_retention_days=30, log_retention_days=30)
+    )
+
+    assert result == 0
+    assert ws.exists(), "GC must defer workspace removal while worker PID lives"
+    assert (ws / "artifact.txt").read_text(encoding="utf-8") == "still needed"
+
+
 def test_run_slash_unknown_action_friendly_error(kanban_home):
     """Unknown subcommand surfaces a single-line usage error prefixed
     with our marker — no `(usage error: 2)` wrapping, no doubled
